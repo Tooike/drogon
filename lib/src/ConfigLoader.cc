@@ -22,9 +22,14 @@
 #include <trantor/utils/Logger.h>
 #ifndef _WIN32
 #include <unistd.h>
+#define os_access access
 #else
 #include <io.h>
+#define os_access _waccess
+#define R_OK 04
+#define W_OK 02
 #endif
+#include <drogon/utils/Utilities.h>
 
 using namespace drogon;
 static bool bytesSize(std::string &sizeStr, size_t &size)
@@ -94,27 +99,20 @@ static bool bytesSize(std::string &sizeStr, size_t &size)
 }
 ConfigLoader::ConfigLoader(const std::string &configFile)
 {
-#ifdef _WIN32
-    if (_access(configFile.c_str(), 0) != 0)
-#else
-    if (access(configFile.c_str(), 0) != 0)
-#endif
+    if (os_access(drogon::utils::toNativePath(configFile).c_str(), 0) != 0)
     {
         std::cerr << "Config file " << configFile << " not found!" << std::endl;
         exit(1);
     }
-#ifdef _WIN32
-    if (_access(configFile.c_str(), 04) != 0)
-#else
-    if (access(configFile.c_str(), R_OK) != 0)
-#endif
+    if (os_access(drogon::utils::toNativePath(configFile).c_str(), R_OK) != 0)
     {
         std::cerr << "No permission to read config file " << configFile
                   << std::endl;
         exit(1);
     }
     configFile_ = configFile;
-    std::ifstream infile(configFile.c_str(), std::ifstream::in);
+    std::ifstream infile(drogon::utils::toNativePath(configFile).c_str(),
+                         std::ifstream::in);
     if (infile)
     {
         try
@@ -513,6 +511,7 @@ static void loadDbClients(const Json::Value &dbClients)
         {
             characterSet = client.get("client_encoding", "").asString();
         }
+        auto timeout = client.get("timeout", -1.0).asDouble();
         drogon::app().createDbClient(type,
                                      host,
                                      (unsigned short)port,
@@ -523,7 +522,8 @@ static void loadDbClients(const Json::Value &dbClients)
                                      filename,
                                      name,
                                      isFast,
-                                     characterSet);
+                                     characterSet,
+                                     timeout);
     }
 }
 
@@ -547,8 +547,10 @@ static void loadRedisClients(const Json::Value &redisClients)
         }
         auto name = client.get("name", "default").asString();
         auto isFast = client.get("is_fast", false).asBool();
+        auto timeout = client.get("timeout", -1.0).asDouble();
+        auto db = client.get("db", 0).asUInt();
         drogon::app().createRedisClient(
-            host, port, name, password, connNum, isFast);
+            host, port, name, password, connNum, isFast, timeout, db);
     }
 }
 
@@ -565,17 +567,49 @@ static void loadListeners(const Json::Value &listeners)
         auto cert = listener.get("cert", "").asString();
         auto key = listener.get("key", "").asString();
         auto useOldTLS = listener.get("use_old_tls", false).asBool();
+        std::vector<std::pair<std::string, std::string>> sslConfCmds;
+        if (listener.isMember("ssl_conf"))
+        {
+            for (const auto &opt : listener["ssl_conf"])
+            {
+                if (opt.size() == 0 || opt.size() > 2)
+                {
+                    LOG_FATAL << "SSL configuration option should be an 1 or "
+                                 "2-element array";
+                    abort();
+                }
+                sslConfCmds.emplace_back(opt[0].asString(),
+                                         opt.get(1, "").asString());
+            }
+        }
         LOG_TRACE << "Add listener:" << addr << ":" << port;
-        drogon::app().addListener(addr, port, useSSL, cert, key, useOldTLS);
+        drogon::app().addListener(
+            addr, port, useSSL, cert, key, useOldTLS, sslConfCmds);
     }
 }
-static void loadSSL(const Json::Value &sslFiles)
+static void loadSSL(const Json::Value &sslConf)
 {
-    if (!sslFiles)
+    if (!sslConf)
         return;
-    auto key = sslFiles.get("key", "").asString();
-    auto cert = sslFiles.get("cert", "").asString();
+    auto key = sslConf.get("key", "").asString();
+    auto cert = sslConf.get("cert", "").asString();
     drogon::app().setSSLFiles(cert, key);
+    std::vector<std::pair<std::string, std::string>> sslConfCmds;
+    if (sslConf.isMember("conf"))
+    {
+        for (const auto &opt : sslConf["conf"])
+        {
+            if (opt.size() == 0 || opt.size() > 2)
+            {
+                LOG_FATAL << "SSL configuration option should be an 1 or "
+                             "2-element array";
+                abort();
+            }
+            sslConfCmds.emplace_back(opt[0].asString(),
+                                     opt.get(1, "").asString());
+        }
+    }
+    drogon::app().setSSLConfigCommands(sslConfCmds);
 }
 void ConfigLoader::load()
 {

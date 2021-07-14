@@ -38,7 +38,7 @@ using HttpRequestPtr = std::shared_ptr<HttpRequest>;
  * type object. Users must specialize the template for a particular type.
  */
 template <typename T>
-T fromRequest(const HttpRequest &req)
+T fromRequest(const HttpRequest &)
 {
     LOG_ERROR << "You must specialize the fromRequest template for the type of "
               << DrClassMap::demangle(typeid(T).name());
@@ -292,8 +292,7 @@ class DROGON_EXPORT HttpRequest
 
     /// Get the Json object of the request
     /**
-     * The content type of the request must be 'application/json', and the query
-     * string (the part after the question mark in the URI) must be empty,
+     * The content type of the request must be 'application/json',
      * otherwise the method returns an empty shared_ptr object.
      */
     virtual const std::shared_ptr<Json::Value> &jsonObject() const = 0;

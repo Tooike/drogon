@@ -154,6 +154,39 @@ DROGON_EXPORT std::string formattedString(const char *format, ...);
  */
 DROGON_EXPORT int createPath(const std::string &path);
 
+#ifdef _WIN32
+/**
+ * @brief Convert a UTF-8 path with arbitrary directory separator to a standard
+ * Windows UCS2 path.
+ * @note Although windows accept both slash and backslash as directory
+ * separator, it is better to stick to its standard.
+ *
+ * @param strUtf8Path Ascii path considered as being UTF-8
+ *
+ * @return std::wstring path, with windows standard backslash directory
+ * separator.
+ */
+DROGON_EXPORT std::wstring toNativePath(const std::string &strPath);
+/**
+ * @brief Convert a UCS2 to an UTF-8 path.
+ *
+ * @param strPath Wide char unicode path
+ *
+ * @return std::string path in UTF-8 unicode, with standard '/' directory
+ * separator.
+ */
+DROGON_EXPORT std::string fromNativePath(std::wstring strPath);
+#else   // _WIN32
+inline const std::string &toNativePath(const std::string &strPath)
+{
+    return strPath;
+}
+inline const std::string &fromNativePath(const std::string &strPath)
+{
+    return strPath;
+}
+#endif  // _WIN32
+
 /// Replace all occurances of from to to inplace
 /**
  * @param from string to replace
@@ -162,6 +195,19 @@ DROGON_EXPORT int createPath(const std::string &path);
 DROGON_EXPORT void replaceAll(std::string &s,
                               const std::string &from,
                               const std::string &to);
+
+/**
+ * @brief Generates cryptographically secure random bytes.
+ *
+ * @param ptr the pointer which the random bytes are stored to
+ * @param size number of bytes to generate
+ *
+ * @return true if generation is successfull. False otherwise
+ *
+ * @note DO NOT abuse this function. Especially if Drogon is built without
+ * OpenSSL. Entropy running low is a real issue.
+ */
+DROGON_EXPORT bool secureRandomBytes(void *ptr, size_t size);
 
 }  // namespace utils
 }  // namespace drogon

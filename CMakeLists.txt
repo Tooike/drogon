@@ -26,7 +26,7 @@ CMAKE_DEPENDENT_OPTION(BUILD_SQLITE "Build with sqlite3 support" ON "BUILD_ORM" 
 CMAKE_DEPENDENT_OPTION(BUILD_REDIS "Build with redis support" ON "BUILD_ORM" OFF)
 
 set(DROGON_MAJOR_VERSION 1)
-set(DROGON_MINOR_VERSION 5)
+set(DROGON_MINOR_VERSION 7)
 set(DROGON_PATCH_VERSION 1)
 set(DROGON_VERSION
     ${DROGON_MAJOR_VERSION}.${DROGON_MINOR_VERSION}.${DROGON_PATCH_VERSION})
@@ -39,6 +39,14 @@ set(INSTALL_INCLUDE_DIR include CACHE PATH "Installation directory for header fi
 set(DEF_INSTALL_DROGON_CMAKE_DIR lib/cmake/Drogon)
 set(INSTALL_DROGON_CMAKE_DIR ${DEF_INSTALL_DROGON_CMAKE_DIR}
     CACHE PATH "Installation directory for cmake files")
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+    # Force MSVC to use UTF-8 because that's what we use. Otherwise it uses
+    # the default of whatever Windows sets and causes encoding issues.
+    message(STATUS "You are using MSVC. Forceing to use UTF-8")
+    add_compile_options("$<$<C_COMPILER_ID:MSVC>:/utf-8>")
+    add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
+endif ()
 
 if (BUILD_DROGON_SHARED)
     set(BUILD_TRANTOR_SHARED TRUE)
@@ -55,36 +63,38 @@ if (BUILD_DROGON_SHARED)
         VERSION ${DROGON_VERSION}
         SOVERSION ${DROGON_MAJOR_VERSION})
     target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
-    if(WIN32)
-      target_link_libraries(${PROJECT_NAME} PUBLIC Rpcrt4 ws2_32)
-      if(CMAKE_CXX_COMPILER_ID MATCHES MSVC)
-          # Ignore MSVC C4251 and C4275 warning of exporting std objects with no dll export
-          # We export class to facilitate maintenance, thus if you compile
-          # drogon on windows as a shared library, you will need to use
-          # exact same compiler for drogon and your app.
-          target_compile_options(${PROJECT_NAME} PUBLIC /wd4251 /wd4275)
-      endif()
-    endif()
+    if (WIN32)
+        target_link_libraries(${PROJECT_NAME} PUBLIC Rpcrt4 ws2_32 crypt32 Advapi32)
+        if (CMAKE_CXX_COMPILER_ID MATCHES MSVC)
+            # Ignore MSVC C4251 and C4275 warning of exporting std objects with no dll export
+            # We export class to facilitate maintenance, thus if you compile
+            # drogon on windows as a shared library, you will need to use
+            # exact same compiler for drogon and your app.
+            target_compile_options(${PROJECT_NAME} PUBLIC /wd4251 /wd4275)
+        endif ()
+    endif ()
 else (BUILD_DROGON_SHARED)
     add_library(${PROJECT_NAME} STATIC)
 endif (BUILD_DROGON_SHARED)
 
-if (CMAKE_CXX_COMPILER_ID MATCHES GNU)
+if (NOT ${CMAKE_PLATFORM_NAME} STREQUAL "Windows" AND CMAKE_CXX_COMPILER_ID MATCHES GNU)
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Werror)
-endif()
+endif ()
 
 include(GenerateExportHeader)
 generate_export_header(${PROJECT_NAME} EXPORT_FILE_NAME ${CMAKE_CURRENT_BINARY_DIR}/exports/drogon/exports.h)
 
 include(cmake/DrogonUtilities.cmake)
+include(cmake/ParseAndAddDrogonTests.cmake)
 include(CheckIncludeFileCXX)
 
 check_include_file_cxx(any HAS_ANY)
 check_include_file_cxx(string_view HAS_STRING_VIEW)
 check_include_file_cxx(coroutine HAS_COROUTINE)
-if (HAS_ANY AND HAS_STRING_VIEW AND HAS_COROUTINE)
+check_include_file_cxx(filesystem HAS_FILESYSTEM)
+if (HAS_ANY AND HAS_STRING_VIEW AND HAS_COROUTINE AND HAS_FILESYSTEM)
     set(DROGON_CXX_STANDARD 20)
-elseif (HAS_ANY AND HAS_STRING_VIEW)
+elseif (HAS_ANY AND HAS_STRING_VIEW AND HAS_FILESYSTEM)
     set(DROGON_CXX_STANDARD 17)
 else ()
     set(DROGON_CXX_STANDARD 14)
@@ -119,19 +129,38 @@ else (NOT WIN32)
 endif (NOT WIN32)
 
 if (DROGON_CXX_STANDARD EQUAL 14)
-    # With C++14, use boost to support any and string_view
+    # With C++14, use Boost to support any and string_view
     message(STATUS "use c++14")
     find_package(Boost 1.61.0 REQUIRED)
-    message(STATUS "boost include dir:" ${Boost_INCLUDE_DIR})
+    find_package(Boost 1.61.0 REQUIRED COMPONENTS filesystem)
+    message(STATUS "Using Boost filesytem, string_view and any")
+    message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIR})
     target_link_libraries(${PROJECT_NAME} PUBLIC Boost::boost)
+    target_link_libraries(${PROJECT_NAME} PUBLIC Boost::filesystem)
     list(APPEND INCLUDE_DIRS_FOR_DYNAMIC_VIEW ${Boost_INCLUDE_DIR})
 elseif (DROGON_CXX_STANDARD EQUAL 17)
+    # With C++17, use Boost if std::filesystem::path is missing
     message(STATUS "use c++17")
+    # Check for partial implementation of c++17 (Windows/OSX only?)
+    try_compile(check_filesystem_path ${CMAKE_BINARY_DIR}/cmaketest
+        ${PROJECT_SOURCE_DIR}/cmake/tests/check_has_std_filesystem_path.cc
+        CXX_STANDARD 17)
+    if (check_filesystem_path)
+        message(STATUS "Using c++17 filesytem::path")
+    else()
+        find_package(Boost 1.49.0 COMPONENTS filesystem system REQUIRED)
+        message(STATUS "Using Boost filesytem::path")
+        message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIR})
+        include_directories(${BOOST_INCLUDE_DIRS})
+        message(STATUS "Boost libraries: " ${Boost_LIBRARIES})
+        target_link_libraries(${PROJECT_NAME} PUBLIC Boost::filesystem Boost::system)
+        list(APPEND INCLUDE_DIRS_FOR_DYNAMIC_VIEW ${Boost_INCLUDE_DIR})
+    endif()
 else ()
     message(STATUS "use c++20")
 endif ()
 
-set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules/)
+list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules/)
 
 # jsoncpp
 find_package(Jsoncpp REQUIRED)
@@ -197,8 +226,10 @@ set(DROGON_SOURCES
     lib/src/NotFound.cc
     lib/src/PluginsManager.cc
     lib/src/SecureSSLRedirector.cc
+    lib/src/AccessLogger.cc
     lib/src/SessionManager.cc
     lib/src/StaticFileRouter.cc
+    lib/src/TaskTimeoutFlag.cc
     lib/src/Utilities.cc
     lib/src/WebSocketClientImpl.cc
     lib/src/WebSocketConnectionImpl.cc
@@ -280,10 +311,10 @@ endif (BUILD_REDIS)
 
 if (NOT Hiredis_FOUND)
     set(DROGON_SOURCES
-            ${DROGON_SOURCES}
-            lib/src/RedisClientSkipped.cc
-            lib/src/RedisResultSkipped.cc
-            lib/src/RedisClientManagerSkipped.cc)
+        ${DROGON_SOURCES}
+        lib/src/RedisClientSkipped.cc
+        lib/src/RedisResultSkipped.cc
+        lib/src/RedisClientManagerSkipped.cc)
 endif (NOT Hiredis_FOUND)
 
 if (BUILD_TESTING)
@@ -333,24 +364,24 @@ if (COZ_PROFILING)
 endif (COZ_PROFILING)
 
 set(DROGON_SOURCES
-        ${DROGON_SOURCES}
-        orm_lib/src/ArrayParser.cc
-        orm_lib/src/Criteria.cc
-        orm_lib/src/DbClient.cc
-        orm_lib/src/DbClientImpl.cc
-        orm_lib/src/DbClientLockFree.cc
-        orm_lib/src/DbConnection.cc
-        orm_lib/src/Exception.cc
-        orm_lib/src/Field.cc
-        orm_lib/src/Result.cc
-        orm_lib/src/Row.cc
-        orm_lib/src/SqlBinder.cc
-        orm_lib/src/TransactionImpl.cc
-        orm_lib/src/RestfulController.cc)
+    ${DROGON_SOURCES}
+    orm_lib/src/ArrayParser.cc
+    orm_lib/src/Criteria.cc
+    orm_lib/src/DbClient.cc
+    orm_lib/src/DbClientImpl.cc
+    orm_lib/src/DbClientLockFree.cc
+    orm_lib/src/DbConnection.cc
+    orm_lib/src/Exception.cc
+    orm_lib/src/Field.cc
+    orm_lib/src/Result.cc
+    orm_lib/src/Row.cc
+    orm_lib/src/SqlBinder.cc
+    orm_lib/src/TransactionImpl.cc
+    orm_lib/src/RestfulController.cc)
 if (pg_FOUND OR MySQL_FOUND OR SQLite3_FOUND)
     set(DROGON_SOURCES
-            ${DROGON_SOURCES}
-            orm_lib/src/DbClientManager.cc)
+        ${DROGON_SOURCES}
+        orm_lib/src/DbClientManager.cc)
 else (pg_FOUND OR MySQL_FOUND OR SQLite3_FOUND)
     set(DROGON_SOURCES ${DROGON_SOURCES} lib/src/DbClientManagerSkipped.cc)
 endif (pg_FOUND OR MySQL_FOUND OR SQLite3_FOUND)
@@ -373,7 +404,7 @@ if (pg_FOUND OR MySQL_FOUND OR SQLite3_FOUND)
     if (MySQL_FOUND)
         option(USE_MYSQL "Enable Mysql" ON)
     else (MySQL_FOUND)
-        option(USE_MYSQL "DisableMysql" OFF)
+        option(USE_MYSQL "Disable Mysql" OFF)
     endif (MySQL_FOUND)
 
     if (SQLite3_FOUND)
@@ -413,6 +444,8 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/templates/config.h.in
     ${PROJECT_BINARY_DIR}/drogon/config.h @ONLY)
 
 if (BUILD_TESTING)
+    message(STATUS "Building tests")
+    enable_testing()
     add_subdirectory(lib/tests)
     if (pg_FOUND)
         add_subdirectory(${PROJECT_SOURCE_DIR}/orm_lib/src/postgresql_impl/test)
@@ -424,12 +457,6 @@ if (BUILD_TESTING)
         add_subdirectory(${PROJECT_SOURCE_DIR}/orm_lib/src/sqlite3_impl/test)
     endif (SQLite3_FOUND)
     add_subdirectory(${PROJECT_SOURCE_DIR}/orm_lib/tests)
-    find_package(GTest)
-    if (GTest_FOUND)
-        message(STATUS "gtest found")
-        enable_testing()
-        add_subdirectory(unittest)
-    endif (GTest_FOUND)
 endif (BUILD_TESTING)
 
 # Installation
@@ -472,6 +499,7 @@ set(DROGON_HEADERS
     lib/inc/drogon/version.h
     lib/inc/drogon/drogon_callbacks.h
     lib/inc/drogon/PubSubService.h
+    lib/inc/drogon/drogon_test.h
     ${CMAKE_CURRENT_BINARY_DIR}/exports/drogon/exports.h)
 install(FILES ${DROGON_HEADERS} DESTINATION ${INSTALL_INCLUDE_DIR}/drogon)
 
@@ -511,7 +539,8 @@ install(FILES ${DROGON_UTIL_HEADERS}
     DESTINATION ${INSTALL_INCLUDE_DIR}/drogon/utils)
 
 set(DROGON_PLUGIN_HEADERS lib/inc/drogon/plugins/Plugin.h
-    lib/inc/drogon/plugins/SecureSSLRedirector.h)
+    lib/inc/drogon/plugins/SecureSSLRedirector.h
+    lib/inc/drogon/plugins/AccessLogger.h)
 install(FILES ${DROGON_PLUGIN_HEADERS}
     DESTINATION ${INSTALL_INCLUDE_DIR}/drogon/plugins)
 
@@ -553,6 +582,7 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/Findcoz-profiler.cmake"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/FindHiredis.cmake"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DrogonUtilities.cmake"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParseAndAddDrogonTests.cmake"
     DESTINATION "${INSTALL_DROGON_CMAKE_DIR}"
     COMPONENT dev)
 
@@ -561,3 +591,4 @@ install(EXPORT DrogonTargets
     DESTINATION "${INSTALL_DROGON_CMAKE_DIR}"
     NAMESPACE Drogon::
     COMPONENT dev)
+

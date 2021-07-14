@@ -32,7 +32,9 @@ void RedisClientManager::createRedisClient(const std::string & /*name*/,
                                            unsigned short /*port*/,
                                            const std::string & /*password*/,
                                            size_t /*connectionNum*/,
-                                           bool /*isFast*/)
+                                           bool /*isFast*/,
+                                           double /*timeout*/,
+                                           unsigned int /*db*/)
 {
     LOG_FATAL << "Redis is not supported by drogon, please install the "
                  "hiredis library first.";

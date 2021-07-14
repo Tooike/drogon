@@ -4,6 +4,124 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.1] - 2021-06-24
+
+### Changes
+
+- Updated Dockerfile to Ubuntu 20.04 & Fixed Timezone Hangup.
+
+- Add jsonstore example.
+
+- Fix some typos.
+
+### Fixed
+
+- Fix single layer directory traversal in StaticFileRouter.
+
+## [1.7.0] - 2021-06-18
+
+### API changes list
+
+- Add the PreSendingAdvice to AOP.
+
+- Make Json::Value as a SQL parameters type.
+
+- Add the int type for the Row index parameter.
+
+- Add SSL_CONF_cmd support.
+
+- Add the setCustomStatusCode method.
+
+### Changes
+
+- Fix sync_wait/co_future use-after-free.
+
+- Add the AccessLogger plugin.
+
+- Make AsyncTask only destruct when the coroutine reaches end of executions.
+
+- Add Drogon test framework.
+
+- Improve WebSocket mask handling.
+
+- Add minimal server side examples.
+
+- Optimize HttpControllersRouter for cases where regex is not needed.
+
+- Create controller instances after running instead of after being called.
+
+### Fixed
+
+- Move resolverPtr when destroying an HttpClientImpl object.
+
+- Modify the way to create sqlite3 client.
+
+- Fix a bug when a network failure occurs on Redis connections.
+
+- Fix a bug of string_view for MSVC.
+
+- Fix 'build.sh -tshared'.
+
+- Fix compiler warnings.
+
+- Fix CacheMap crash in CI tests.
+
+## [1.6.0] - 2021-05-15
+
+### API changes list
+
+- Add option to set default handler.
+
+- Add the setTimeout() method to the DbClient class and the RedisClient class.
+
+- Add the validateCert parameter to the newWebSocketClient method.
+
+### Changed
+
+- A few mini changes to drogon_ctl command.
+
+- Improve the MultiPartParser class.
+
+- Add GNU -Werror & fix warnings.
+
+- Enhancements on files part.
+
+- Add version/soversion to shared library.
+
+- Disallow coroutines to be resolved as plain subroutine handlers.
+
+- Send the content-length header even if the body(POST,PUT,OPTIONS,PATCH) is empty.
+
+- Use make_exception_ptr instead of throw/catch when possible.
+
+- Remove duplicated inclusion.
+
+- Print error before terminating in AsyncTask.
+
+- Allow users to override drogon Find modules.
+
+- Use two-phase construction for the DbClientImpl and the RedisClientImpl.
+
+- Add support 'select <db>' for redis.
+
+### Fixed
+
+- Fix a bug of the Transaction class.
+
+- Copy CoroMapper.h to installation location.
+
+- Remove the related request from the buffer if it's not sent after the timeout.
+
+- Fix ORM with SQLite3 not compiling on Arch Linux.
+
+- Fix an error when constructing RedisClientImpl objects.
+
+- Fix coroutine frame leak upon assigning to awaitable.
+
+- Set running flag to true before installing plugins.
+
+- Fix double free in coroutine exception handling.
+
 ## [1.5.1] - 2021-04-10
 
 ### Fixed
@@ -718,7 +836,13 @@ All notable changes to this project will be documented in this file.
 
 ## [1.0.0-beta1] - 2019-06-11
 
-[Unreleased]: https://github.com/an-tao/drogon/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/an-tao/drogon/compare/v1.7.1...HEAD
+
+[1.7.1]: https://github.com/an-tao/drogon/compare/v1.7.0...v1.7.1
+
+[1.7.0]: https://github.com/an-tao/drogon/compare/v1.6.0...v1.7.0
+
+[1.6.0]: https://github.com/an-tao/drogon/compare/v1.5.1...v1.6.0
 
 [1.5.1]: https://github.com/an-tao/drogon/compare/v1.5.0...v1.5.1
 

@@ -95,7 +95,8 @@ class DROGON_EXPORT RedisClient
     static std::shared_ptr<RedisClient> newRedisClient(
         const trantor::InetAddress &serverAddress,
         size_t numberOfConnections = 1,
-        const std::string &password = "");
+        const std::string &password = "",
+        const unsigned int db = 0);
     /**
      * @brief Execute a redis command
      *
@@ -125,17 +126,34 @@ class DROGON_EXPORT RedisClient
      * @brief Create a redis transaction object.
      *
      * @return std::shared_ptr<RedisTransaction>
+     * @note An exception with kTimeout code is thrown if the operation is
+     * timed out. see RedisException.h
      */
-    virtual std::shared_ptr<RedisTransaction> newTransaction() = 0;
+    virtual std::shared_ptr<RedisTransaction> newTransaction() noexcept(
+        false) = 0;
 
     /**
      * @brief Create a transaction object in asynchronous mode.
      *
      * @return std::shared_ptr<RedisTransaction>
+     * @note An empty shared_ptr object is returned via the callback if the
+     * operation is timed out.
      */
     virtual void newTransactionAsync(
         const std::function<void(const std::shared_ptr<RedisTransaction> &)>
             &callback) = 0;
+    /**
+     * @brief Set the Timeout value of execution of a command.
+     *
+     * @param timeout in seconds, if the result is not returned from the
+     * server within the timeout, a RedisException with "Command execution
+     * timeout" string is generated and returned to the caller.
+     * @note set the timeout value to zero or negative for no limit on time. The
+     * default value is -1.0, this means there is no time limit if this method
+     * is not called.
+     */
+    virtual void setTimeout(double timeout) = 0;
+
     virtual ~RedisClient() = default;
 #ifdef __cpp_impl_coroutine
     /**
@@ -247,9 +265,9 @@ inline void internal::RedisTransactionAwaiter::await_suspend(
     client_->newTransactionAsync(
         [this, &handle](const std::shared_ptr<RedisTransaction> &transaction) {
             if (transaction == nullptr)
-                setException(std::make_exception_ptr(
-                    RedisException(RedisErrorCode::kInternalError,
-                                   "Failed to create transaction")));
+                setException(std::make_exception_ptr(RedisException(
+                    RedisErrorCode::kTimeout,
+                    "Timeout, no connection available for transaction")));
             else
                 setValue(transaction);
             handle.resume();

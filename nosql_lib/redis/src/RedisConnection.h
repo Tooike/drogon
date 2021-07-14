@@ -42,6 +42,7 @@ class RedisConnection : public trantor::NonCopyable,
   public:
     RedisConnection(const trantor::InetAddress &serverAddress,
                     const std::string &password,
+                    const unsigned int db,
                     trantor::EventLoop *loop);
     void setConnectCallback(
         const std::function<void(std::shared_ptr<RedisConnection> &&)>
@@ -162,11 +163,16 @@ class RedisConnection : public trantor::NonCopyable,
                      args);
         va_end(args);
     }
+    trantor::EventLoop *getLoop() const
+    {
+        return loop_;
+    }
 
   private:
     redisAsyncContext *redisContext_{nullptr};
     const trantor::InetAddress serverAddr_;
     const std::string password_;
+    const unsigned int db_;
     trantor::EventLoop *loop_{nullptr};
     std::unique_ptr<trantor::Channel> channel_{nullptr};
     std::function<void(std::shared_ptr<RedisConnection> &&)> connectCallback_;

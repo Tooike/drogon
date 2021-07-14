@@ -19,7 +19,7 @@
 #include <trantor/net/EventLoopThreadPool.h>
 #include <vector>
 #include <unordered_set>
-#include <queue>
+#include <list>
 #include <future>
 
 namespace drogon
@@ -35,7 +35,8 @@ class RedisClientLockFree final
     RedisClientLockFree(const trantor::InetAddress &serverAddress,
                         size_t numberOfConnections,
                         trantor::EventLoop *loop,
-                        std::string password = "");
+                        std::string password = "",
+                        unsigned int db = 0);
     void execCommandAsync(RedisResultCallback &&resultCallback,
                           RedisExceptionCallback &&exceptionCallback,
                           string_view command,
@@ -54,6 +55,11 @@ class RedisClientLockFree final
         const std::function<void(const RedisTransactionPtr &)> &callback)
         override;
 
+    void setTimeout(double timeout) override
+    {
+        timeout_ = timeout;
+    }
+
   private:
     trantor::EventLoop *loop_;
     std::unordered_set<RedisConnectionPtr> connections_;
@@ -62,11 +68,18 @@ class RedisClientLockFree final
     RedisConnectionPtr newConnection();
     const trantor::InetAddress serverAddr_;
     const std::string password_;
+    const unsigned int db_;
     const size_t numberOfConnections_;
-    std::queue<std::function<void(const RedisConnectionPtr &)>> tasks_;
+    std::list<std::shared_ptr<std::function<void(const RedisConnectionPtr &)>>>
+        tasks_;
+    double timeout_{-1.0};
     std::shared_ptr<RedisTransaction> makeTransaction(
         const RedisConnectionPtr &connPtr);
     void handleNextTask(const RedisConnectionPtr &connPtr);
+    void execCommandAsyncWithTimeout(string_view command,
+                                     RedisResultCallback &&resultCallback,
+                                     RedisExceptionCallback &&exceptionCallback,
+                                     va_list ap);
 };
 }  // namespace nosql
 }  // namespace drogon

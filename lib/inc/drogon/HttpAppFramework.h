@@ -341,6 +341,15 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
         const std::function<void(const HttpRequestPtr &,
                                  const HttpResponsePtr &)> &advice) = 0;
 
+    /// Register an advice called before a response is sent to the client.
+    /**
+     * @note This advice is different from the PostHandlingAdvice, responses to
+     * static resources are also handled here.
+     */
+    virtual HttpAppFramework &registerPreSendingAdvice(
+        const std::function<void(const HttpRequestPtr &,
+                                 const HttpResponsePtr &)> &advice) = 0;
+
     /* End of AOP methods */
 
     /// Load the configuration file with json format.
@@ -428,10 +437,10 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
         const std::string &handlerName = "")
     {
         LOG_TRACE << "pathPattern:" << pathPattern;
-        internal::HttpBinderBasePtr binder;
-
-        binder = std::make_shared<internal::HttpBinder<FUNCTION>>(
+        auto binder = std::make_shared<internal::HttpBinder<FUNCTION>>(
             std::forward<FUNCTION>(function));
+
+        getLoop()->queueInLoop([binder]() { binder->createHandlerInstance(); });
 
         std::vector<HttpMethod> validMethods;
         std::vector<std::string> filters;
@@ -658,6 +667,13 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
     virtual HttpAppFramework &setSSLFiles(const std::string &certPath,
                                           const std::string &keyPath) = 0;
 
+    /// Supplies file style SSL options to `SSL_CONF_cmd`. Valid options are
+    /// available at
+    /// https://www.openssl.org/docs/manmaster/man3/SSL_CONF_cmd.html
+    virtual HttpAppFramework &setSSLConfigCommands(
+        const std::vector<std::pair<std::string, std::string>>
+            &sslConfCmds) = 0;
+
     /// Add a listener for http or https service
     /**
      * @param ip is the ip that the listener listens on.
@@ -674,12 +690,15 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
      * @note
      * This operation can be performed by an option in the configuration file.
      */
-    virtual HttpAppFramework &addListener(const std::string &ip,
-                                          uint16_t port,
-                                          bool useSSL = false,
-                                          const std::string &certFile = "",
-                                          const std::string &keyFile = "",
-                                          bool useOldTLS = false) = 0;
+    virtual HttpAppFramework &addListener(
+        const std::string &ip,
+        uint16_t port,
+        bool useSSL = false,
+        const std::string &certFile = "",
+        const std::string &keyFile = "",
+        bool useOldTLS = false,
+        const std::vector<std::pair<std::string, std::string>> &sslConfCmds =
+            {}) = 0;
 
     /// Enable sessions supporting.
     /**
@@ -703,7 +722,7 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
        @endcode
      */
     inline HttpAppFramework &enableSession(
-        const std::chrono::duration<long double> &timeout)
+        const std::chrono::duration<double> &timeout)
     {
         return enableSession((size_t)timeout.count());
     }
@@ -959,7 +978,7 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
        @endcode
      */
     inline HttpAppFramework &setIdleConnectionTimeout(
-        const std::chrono::duration<long double> &timeout)
+        const std::chrono::duration<double> &timeout)
     {
         return setIdleConnectionTimeout((size_t)timeout.count());
     }
@@ -1222,6 +1241,9 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
      * @param filename The file name of sqlite3 database file.
      * @param name The client name.
      * @param isFast Indicates if the client is a fast database client.
+     * @param characterSet The character set of the database server.
+     * @param timeout The timeout in seconds for executing SQL queries. zero or
+     * negative value means no timeout.
      *
      * @note
      * This operation can be performed by an option in the configuration file.
@@ -1237,7 +1259,8 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
         const std::string &filename = "",
         const std::string &name = "default",
         const bool isFast = false,
-        const std::string &characterSet = "") = 0;
+        const std::string &characterSet = "",
+        double timeout = -1.0) = 0;
 
     /// Create a redis client
     /**
@@ -1257,7 +1280,9 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
         const std::string &name = "default",
         const std::string &password = "",
         size_t connectionNum = 1,
-        bool isFast = false) = 0;
+        bool isFast = false,
+        double timeout = -1.0,
+        unsigned int db = 0) = 0;
 
     /// Get the DNS resolver
     /**

@@ -52,17 +52,23 @@ class HttpAppFrameworkImpl final : public HttpAppFramework
     }
 
     PluginBase *getPlugin(const std::string &name) override;
-    HttpAppFramework &addListener(const std::string &ip,
-                                  uint16_t port,
-                                  bool useSSL,
-                                  const std::string &certFile,
-                                  const std::string &keyFile,
-                                  bool useOldTLS) override;
+    HttpAppFramework &addListener(
+        const std::string &ip,
+        uint16_t port,
+        bool useSSL,
+        const std::string &certFile,
+        const std::string &keyFile,
+        bool useOldTLS,
+        const std::vector<std::pair<std::string, std::string>> &sslConfCmds)
+        override;
     HttpAppFramework &setThreadNum(size_t threadNum) override;
     size_t getThreadNum() const override
     {
         return threadNum_;
     }
+    HttpAppFramework &setSSLConfigCommands(
+        const std::vector<std::pair<std::string, std::string>> &sslConfCmds)
+        override;
     HttpAppFramework &setSSLFiles(const std::string &certPath,
                                   const std::string &keyPath) override;
     void run() override;
@@ -190,7 +196,13 @@ class HttpAppFrameworkImpl final : public HttpAppFramework
         postHandlingAdvices_.emplace_back(advice);
         return *this;
     }
-
+    HttpAppFramework &registerPreSendingAdvice(
+        const std::function<void(const HttpRequestPtr &,
+                                 const HttpResponsePtr &)> &advice) override
+    {
+        preSendingAdvices_.emplace_back(advice);
+        return *this;
+    }
     HttpAppFramework &setDefaultHandler(DefaultHandler handler) override;
 
     HttpAppFramework &enableSession(const size_t timeout) override
@@ -452,13 +464,16 @@ class HttpAppFrameworkImpl final : public HttpAppFramework
                                      const std::string &filename,
                                      const std::string &name,
                                      bool isFast,
-                                     const std::string &characterSet) override;
+                                     const std::string &characterSet,
+                                     double timeout) override;
     HttpAppFramework &createRedisClient(const std::string &ip,
                                         unsigned short port,
                                         const std::string &name,
                                         const std::string &password,
                                         size_t connectionNum,
-                                        bool isFast) override;
+                                        bool isFast,
+                                        double timeout,
+                                        unsigned int db) override;
     nosql::RedisClientPtr getRedisClient(const std::string &name) override;
     nosql::RedisClientPtr getFastRedisClient(const std::string &name) override;
     std::vector<trantor::InetAddress> getListeners() const override;
@@ -573,6 +588,7 @@ class HttpAppFrameworkImpl final : public HttpAppFramework
     std::unique_ptr<SharedLibManager> sharedLibManagerPtr_;
 #endif
 
+    std::vector<std::pair<std::string, std::string>> sslConfCmds_;
     std::string sslCertPath_;
     std::string sslKeyPath_;
 
@@ -634,7 +650,9 @@ class HttpAppFrameworkImpl final : public HttpAppFramework
     std::vector<
         std::function<void(const HttpRequestPtr &, const HttpResponsePtr &)>>
         postHandlingAdvices_;
-
+    std::vector<
+        std::function<void(const HttpRequestPtr &, const HttpResponsePtr &)>>
+        preSendingAdvices_;
     std::vector<std::function<void(const HttpRequestPtr &)>>
         preRoutingObservers_;
     std::vector<std::function<void(const HttpRequestPtr &)>>

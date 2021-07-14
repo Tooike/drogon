@@ -291,7 +291,8 @@ void create_view::createViewFiles(std::vector<std::string> &cspFileNames)
     for (auto const &file : cspFileNames)
     {
         std::cout << "create view:" << file << std::endl;
-        createViewFile(file);
+        if (createViewFile(file) != 0)
+            exit(1);
     }
 }
 int create_view::createViewFile(const std::string &script_filename)
@@ -390,7 +391,7 @@ void create_view::newViewHeaderFile(std::ofstream &file,
          << "(){};\n\t"
             "virtual std::string genText(const drogon::DrTemplateData &) "
             "override;\n};\n";
-    for (auto i = 0; i < namespaces_.size(); ++i)
+    for (std::size_t i = 0; i < namespaces_.size(); ++i)
     {
         file << "}\n";
     }
@@ -489,7 +490,7 @@ void create_view::newViewSourceFile(std::ofstream &file,
     if (!namespaces_.empty())
     {
         file << "using namespace ";
-        for (int i = 0; i < namespaces_.size(); ++i)
+        for (std::size_t i = 0; i < namespaces_.size(); ++i)
         {
             if (i != namespaces_.size() - 1)
             {

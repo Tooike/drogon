@@ -21,7 +21,6 @@
 #include "HttpSimpleControllersRouter.h"
 #include "HttpControllersRouter.h"
 #include "WebsocketControllersRouter.h"
-#include "HttpClientImpl.h"
 #include "AOPAdvice.h"
 #include "ConfigLoader.h"
 #include "HttpServer.h"
@@ -41,6 +40,7 @@
 #include <drogon/HttpTypes.h>
 #include <drogon/Session.h>
 #include <drogon/utils/Utilities.h>
+#include "filesystem.h"
 #include <trantor/utils/AsyncFileLogger.h>
 #include <json/json.h>
 
@@ -59,8 +59,12 @@
 #include <sys/file.h>
 #include <uuid.h>
 #include <unistd.h>
+#define os_access access
 #else
 #include <io.h>
+#define os_access _waccess
+#define R_OK 04
+#define W_OK 02
 #endif
 
 using namespace drogon;
@@ -123,8 +127,11 @@ void defaultExceptionHandler(
     const HttpRequestPtr &req,
     std::function<void(const HttpResponsePtr &)> &&callback)
 {
-    LOG_ERROR << "Unhandled exception in " << req->query()
-              << ", what():" << e.what();
+    std::string pathWithQuery = req->path();
+    if (req->query().empty() == false)
+        pathWithQuery += "?" + req->query();
+    LOG_ERROR << "Unhandled exception in " << pathWithQuery
+              << ", what(): " << e.what();
     const auto &handler = app().getCustomErrorHandler();
     callback(handler(k500InternalServerError));
 }
@@ -336,16 +343,18 @@ PluginBase *HttpAppFrameworkImpl::getPlugin(const std::string &name)
 {
     return pluginsManagerPtr_->getPlugin(name);
 }
-HttpAppFramework &HttpAppFrameworkImpl::addListener(const std::string &ip,
-                                                    uint16_t port,
-                                                    bool useSSL,
-                                                    const std::string &certFile,
-                                                    const std::string &keyFile,
-                                                    bool useOldTLS)
+HttpAppFramework &HttpAppFrameworkImpl::addListener(
+    const std::string &ip,
+    uint16_t port,
+    bool useSSL,
+    const std::string &certFile,
+    const std::string &keyFile,
+    bool useOldTLS,
+    const std::vector<std::pair<std::string, std::string>> &sslConfCmds)
 {
     assert(!running_);
     listenerManagerPtr_->addListener(
-        ip, port, useSSL, certFile, keyFile, useOldTLS);
+        ip, port, useSSL, certFile, keyFile, useOldTLS, sslConfCmds);
     return *this;
 }
 HttpAppFramework &HttpAppFrameworkImpl::setMaxConnectionNum(
@@ -389,20 +398,14 @@ HttpAppFramework &HttpAppFrameworkImpl::setLogPath(
 {
     if (logPath.empty())
         return *this;
-#ifdef _WIN32
-    if (_access(logPath.c_str(), 0) != 0)
-#else
-    if (access(logPath.c_str(), 0) != 0)
-#endif
+    // std::filesystem does not provide a method to check access permissions, so
+    // keep existing code
+    if (os_access(utils::toNativePath(logPath).c_str(), 0) != 0)
     {
         std::cerr << "Log path does not exist!\n";
         exit(1);
     }
-#ifdef _WIN32
-    if (_access(logPath.c_str(), 06) != 0)
-#else
-    if (access(logPath.c_str(), R_OK | W_OK) != 0)
-#endif
+    if (os_access(utils::toNativePath(logPath).c_str(), R_OK | W_OK) != 0)
     {
         std::cerr << "Unable to access log path!\n";
         exit(1);
@@ -416,6 +419,12 @@ HttpAppFramework &HttpAppFrameworkImpl::setLogLevel(
     trantor::Logger::LogLevel level)
 {
     trantor::Logger::setLogLevel(level);
+    return *this;
+}
+HttpAppFramework &HttpAppFrameworkImpl::setSSLConfigCommands(
+    const std::vector<std::pair<std::string, std::string>> &sslConfCmds)
+{
+    sslConfCmds_ = sslConfCmds;
     return *this;
 }
 HttpAppFramework &HttpAppFrameworkImpl::setSSLFiles(const std::string &certPath,
@@ -483,11 +492,9 @@ void HttpAppFrameworkImpl::run()
     // set logger
     if (!logPath_.empty())
     {
-#ifdef _WIN32
-        if (_access(logPath_.c_str(), 06) != 0)
-#else
-        if (access(logPath_.c_str(), R_OK | W_OK) != 0)
-#endif
+        // std::filesystem does not provide a method to check access
+        // permissions, so keep existing code
+        if (os_access(utils::toNativePath(logPath_).c_str(), R_OK | W_OK) != 0)
         {
             LOG_ERROR << "log file path not exist";
             abort();
@@ -524,14 +531,23 @@ void HttpAppFrameworkImpl::run()
 #endif
     // Create all listeners.
     auto ioLoops = listenerManagerPtr_->createListeners(
-        std::bind(&HttpAppFrameworkImpl::onAsyncRequest, this, _1, _2),
-        std::bind(&HttpAppFrameworkImpl::onNewWebsockRequest, this, _1, _2, _3),
-        std::bind(&HttpAppFrameworkImpl::onConnection, this, _1),
+        [this](const HttpRequestImplPtr &req,
+               std::function<void(const HttpResponsePtr &)> &&callback) {
+            onAsyncRequest(req, std::move(callback));
+        },
+        [this](const HttpRequestImplPtr &req,
+               std::function<void(const HttpResponsePtr &)> &&callback,
+               const WebSocketConnectionImplPtr &wsConnPtr) {
+            onNewWebsockRequest(req, std::move(callback), wsConnPtr);
+        },
+        [this](const trantor::TcpConnectionPtr &conn) { onConnection(conn); },
         idleConnectionTimeout_,
         sslCertPath_,
         sslKeyPath_,
+        sslConfCmds_,
         threadNum_,
-        syncAdvices_);
+        syncAdvices_,
+        preSendingAdvices_);
     assert(ioLoops.size() == threadNum_);
     for (size_t i = 0; i < threadNum_; ++i)
     {
@@ -548,7 +564,8 @@ void HttpAppFrameworkImpl::run()
         sessionManagerPtr_ =
             std::make_unique<SessionManager>(getLoop(), sessionTimeout_);
     }
-
+    // now start runing!!
+    running_ = true;
     // Initialize plugins
     const auto &pluginConfig = jsonConfig_["plugins"];
     if (!pluginConfig.isNull())
@@ -561,9 +578,6 @@ void HttpAppFrameworkImpl::run()
                                                      // TODO: new plugin
                                                  });
     }
-
-    // now start runing!!
-    running_ = true;
     httpCtrlsRouterPtr_->init(ioLoops);
     httpSimpleCtrlsRouterPtr_->init(ioLoops);
     staticFileRouterPtr_->init(ioLoops);
@@ -649,22 +663,14 @@ HttpAppFramework &HttpAppFrameworkImpl::setUploadPath(
     const std::string &uploadPath)
 {
     assert(!uploadPath.empty());
-    if (uploadPath[0] == '/' ||
-        (uploadPath.length() >= 2 && uploadPath[0] == '.' &&
-         uploadPath[1] == '/') ||
-        (uploadPath.length() >= 3 && uploadPath[0] == '.' &&
-         uploadPath[1] == '.' && uploadPath[2] == '/') ||
-        uploadPath == "." || uploadPath == "..")
+
+    filesystem::path fsUploadPath(utils::toNativePath(uploadPath));
+    if (!fsUploadPath.is_absolute())
     {
-        uploadPath_ = uploadPath;
+        filesystem::path fsRoot(utils::toNativePath(rootPath_));
+        fsUploadPath = fsRoot / fsUploadPath;
     }
-    else
-    {
-        if (rootPath_[rootPath_.length() - 1] == '/')
-            uploadPath_ = rootPath_ + uploadPath;
-        else
-            uploadPath_ = rootPath_ + "/" + uploadPath;
-    }
+    uploadPath_ = utils::fromNativePath(fsUploadPath.native());
     return *this;
 }
 void HttpAppFrameworkImpl::findSessionForRequest(const HttpRequestImplPtr &req)
@@ -958,7 +964,8 @@ HttpAppFramework &HttpAppFrameworkImpl::createDbClient(
     const std::string &filename,
     const std::string &name,
     const bool isFast,
-    const std::string &characterSet)
+    const std::string &characterSet,
+    double timeout)
 {
     assert(!running_);
     dbClientManagerPtr_->createDbClient(dbType,
@@ -971,7 +978,8 @@ HttpAppFramework &HttpAppFrameworkImpl::createDbClient(
                                         filename,
                                         name,
                                         isFast,
-                                        characterSet);
+                                        characterSet,
+                                        timeout);
     return *this;
 }
 
@@ -981,11 +989,13 @@ HttpAppFramework &HttpAppFrameworkImpl::createRedisClient(
     const std::string &name,
     const std::string &password,
     size_t connectionNum,
-    bool isFast)
+    bool isFast,
+    double timeout,
+    unsigned int db)
 {
     assert(!running_);
     redisClientManagerPtr_->createRedisClient(
-        name, ip, port, password, connectionNum, isFast);
+        name, ip, port, password, connectionNum, isFast, timeout, db);
     return *this;
 }
 void HttpAppFrameworkImpl::quit()

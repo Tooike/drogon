@@ -287,7 +287,8 @@ void HttpRequestImpl::appendToBuffer(trantor::MsgBuffer *output) const
                 content.append("\"; filename=\"");
                 content.append(file.fileName());
                 content.append("\"\r\n\r\n");
-                std::ifstream infile(file.path(), std::ifstream::binary);
+                std::ifstream infile(utils::toNativePath(file.path()),
+                                     std::ifstream::binary);
                 if (!infile)
                 {
                     LOG_ERROR << file.path() << " not found";
@@ -310,24 +311,32 @@ void HttpRequestImpl::appendToBuffer(trantor::MsgBuffer *output) const
         }
     }
     assert(!(!content.empty() && !content_.empty()));
-    if (!passThrough_ && (!content.empty() || !content_.empty()))
+    if (!passThrough_)
     {
-        char buf[64];
-        auto len =
-            snprintf(buf,
-                     sizeof(buf),
-                     contentLengthFormatString<decltype(content.length())>(),
-                     content.length() + content_.length());
-        output->append(buf, len);
-        if (contentTypeString_.empty())
+        if (!content.empty() || !content_.empty())
         {
-            auto &type = webContentTypeToString(contentType_);
-            output->append(type.data(), type.length());
+            char buf[64];
+            auto len = snprintf(
+                buf,
+                sizeof(buf),
+                contentLengthFormatString<decltype(content.length())>(),
+                content.length() + content_.length());
+            output->append(buf, len);
+            if (contentTypeString_.empty())
+            {
+                auto &type = webContentTypeToString(contentType_);
+                output->append(type.data(), type.length());
+            }
         }
-    }
-    if (!passThrough_ && !contentTypeString_.empty())
-    {
-        output->append(contentTypeString_);
+        else if (method_ == Post || method_ == Put || method_ == Options ||
+                 method_ == Patch)
+        {
+            output->append("content-length: 0\r\n", 19);
+        }
+        if (!contentTypeString_.empty())
+        {
+            output->append(contentTypeString_);
+        }
     }
     for (auto it = headers_.begin(); it != headers_.end(); ++it)
     {
@@ -342,7 +351,7 @@ void HttpRequestImpl::appendToBuffer(trantor::MsgBuffer *output) const
         for (auto it = cookies_.begin(); it != cookies_.end(); ++it)
         {
             output->append(it->first);
-            output->append("= ");
+            output->append("=");
             output->append(it->second);
             output->append(";");
         }
@@ -391,6 +400,11 @@ void HttpRequestImpl::addHeader(const char *start,
                     ++cpos;
                 cookie_name = cookie_name.substr(cpos);
                 std::string cookie_value = coo.substr(epos + 1);
+                cpos = 0;
+                while (cpos < cookie_value.length() &&
+                       isspace(cookie_value[cpos]))
+                    ++cpos;
+                cookie_value = cookie_value.substr(cpos);
                 cookies_[std::move(cookie_name)] = std::move(cookie_value);
             }
             value = value.substr(pos + 1);
@@ -408,6 +422,11 @@ void HttpRequestImpl::addHeader(const char *start,
                     ++cpos;
                 cookie_name = cookie_name.substr(cpos);
                 std::string cookie_value = coo.substr(epos + 1);
+                cpos = 0;
+                while (cpos < cookie_value.length() &&
+                       isspace(cookie_value[cpos]))
+                    ++cpos;
+                cookie_value = cookie_value.substr(cpos);
                 cookies_[std::move(cookie_name)] = std::move(cookie_value);
             }
         }
