@@ -14,16 +14,21 @@
 
 #pragma once
 
-#include "impl_forwards.h"
-#include <drogon/HttpClient.h>
 #include <drogon/Cookie.h>
+#include <drogon/HttpClient.h>
 #include <trantor/net/EventLoop.h>
-#include <trantor/net/TcpClient.h>
 #include <trantor/net/Resolver.h>
+#include <trantor/net/TcpClient.h>
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <functional>
+#include <future>
+#include <list>
 #include <mutex>
 #include <queue>
-#include <list>
 #include <vector>
+#include "impl_forwards.h"
 
 namespace drogon
 {
@@ -46,14 +51,17 @@ class HttpClientImpl final : public HttpClient,
     void sendRequest(const HttpRequestPtr &req,
                      HttpReqCallback &&callback,
                      double timeout = 0) override;
+
     trantor::EventLoop *getLoop() override
     {
         return loop_;
     }
+
     void setPipeliningDepth(size_t depth) override
     {
         pipeliningDepth_ = depth;
     }
+
     ~HttpClientImpl();
 
     void enableCookies(bool flag = true) override
@@ -71,14 +79,25 @@ class HttpClientImpl final : public HttpClient,
         validCookies_.emplace_back(cookie);
     }
 
+    void addHeader(std::string field, const std::string &value) override
+    {
+        std::transform(field.begin(),
+                       field.end(),
+                       field.begin(),
+                       [](unsigned char c) { return tolower(c); });
+        headers_[std::move(field)] = value;
+    }
+
     size_t bytesSent() const override
     {
         return bytesSent_;
     }
+
     size_t bytesReceived() const override
     {
         return bytesReceived_;
     }
+
     void setUserAgent(const std::string &userAgent) override
     {
         userAgent_ = userAgent;
@@ -99,6 +118,50 @@ class HttpClientImpl final : public HttpClient,
     bool secure() const override
     {
         return useSSL_;
+    }
+
+    void setCertPath(const std::string &cert, const std::string &key) override;
+    void addSSLConfigs(const std::vector<std::pair<std::string, std::string>>
+                           &sslConfCmds) override;
+
+    void setSockOptCallback(std::function<void(int)> cb) override
+    {
+        sockOptCallback_ = std::move(cb);
+    }
+
+    std::size_t outstandingRequests() const override
+    {
+        return outstandingRequests_.load(std::memory_order_relaxed);
+    }
+
+    std::size_t requestsBufferSize() override
+    {
+        return requestsBufferSize_.load(std::memory_order_relaxed);
+    }
+
+    void enqueueRequest(const HttpRequestPtr &req,
+                        const HttpReqCallback &callback)
+    {
+        requestsBuffer_.push_back({req, callback});
+        requestsBufferSize_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void popFrontRequest()
+    {
+        if (!requestsBuffer_.empty())
+        {
+            requestsBuffer_.pop_front();
+            requestsBufferSize_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    using RequestBufferIter =
+        std::list<std::pair<HttpRequestPtr, HttpReqCallback>>::iterator;
+
+    void eraseRequest(RequestBufferIter iter)
+    {
+        requestsBuffer_.erase(iter);
+        requestsBufferSize_.fetch_sub(1, std::memory_order_relaxed);
     }
 
   private:
@@ -124,15 +187,24 @@ class HttpClientImpl final : public HttpClient,
     void onRecvMessage(const trantor::TcpConnectionPtr &, trantor::MsgBuffer *);
     void onError(ReqResult result);
     std::string domain_;
+    bool isDomainName_{true};  // true if domain_ is name
+    std::atomic<std::size_t> outstandingRequests_{0};
+    std::atomic<std::size_t> requestsBufferSize_{0};
     size_t pipeliningDepth_{0};
     bool enableCookies_{false};
     std::vector<Cookie> validCookies_;
+    SafeStringMap<std::string> headers_;
     size_t bytesSent_{0};
     size_t bytesReceived_{0};
     bool dns_{false};
     std::shared_ptr<trantor::Resolver> resolverPtr_;
     bool useOldTLS_{false};
     std::string userAgent_{"DrogonClient"};
+    std::vector<std::pair<std::string, std::string>> sslConfCmds_;
+    std::string clientCertPath_;
+    std::string clientKeyPath_;
+    std::function<void(int)> sockOptCallback_;
 };
+
 using HttpClientImplPtr = std::shared_ptr<HttpClientImpl>;
 }  // namespace drogon

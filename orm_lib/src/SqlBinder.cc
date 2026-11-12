@@ -16,18 +16,49 @@
 #include <drogon/orm/DbClient.h>
 #include <drogon/orm/SqlBinder.h>
 #include <drogon/utils/Utilities.h>
+#include <cstring>
 #include <future>
-#include <iostream>
 #include <regex>
-#include <stdio.h>
+#if defined(__cpp_lib_format)
+#include <format>
+#endif
 #if USE_MYSQL
 #include <mysql.h>
 #endif
+
 using namespace drogon::orm;
 using namespace drogon::orm::internal;
+
 void SqlBinder::exec()
 {
     execed_ = true;
+    if (type_ == ClientType::PostgreSQL)
+    {
+        // libpq reads text-format parameters up to the first NUL and ignores
+        // the length, so "admin\0x" would silently be sent as "admin".
+        // PostgreSQL text cannot hold NUL anyway; refuse instead of truncating.
+        for (size_t i = 0; i < parameters_.size(); ++i)
+        {
+            if (formats_[i] == 0 && parameters_[i] != nullptr &&
+                std::memchr(parameters_[i], '\0', lengths_[i]) != nullptr)
+            {
+                SqlError error("Text parameter contains a NUL byte",
+                               std::string(sqlViewPtr_, sqlViewLength_));
+                if (mode_ == Mode::Blocking && !destructed_)
+                    throw error;
+                if (isExceptionPtr_)
+                {
+                    if (exceptionPtrCallback_)
+                        exceptionPtrCallback_(std::make_exception_ptr(error));
+                }
+                else if (exceptionCallback_)
+                {
+                    exceptionCallback_(error);
+                }
+                return;
+            }
+        }
+    }
     if (mode_ == Mode::NonBlocking)
     {
         // nonblocking mode,default mode
@@ -124,6 +155,7 @@ void SqlBinder::exec()
         }
     }
 }
+
 SqlBinder::~SqlBinder()
 {
     destructed_ = true;
@@ -133,12 +165,54 @@ SqlBinder::~SqlBinder()
     }
 }
 
-SqlBinder &SqlBinder::operator<<(const std::string &str)
+SqlBinder &SqlBinder::operator<<(const RawParameter &param)
 {
-    std::shared_ptr<std::string> obj = std::make_shared<std::string>(str);
+    objs_.push_back(param.obj);
+    parameters_.push_back(param.parameter);
+    lengths_.push_back(param.length);
+    formats_.push_back(param.format);
+    ++parametersNumber_;
+    return *this;
+}
+
+SqlBinder &SqlBinder::operator<<(RawParameter &&param)
+{
+    objs_.push_back(std::move(param.obj));
+    parameters_.push_back(std::move(param.parameter));
+    lengths_.push_back(std::move(param.length));
+    formats_.push_back(std::move(param.format));
+    ++parametersNumber_;
+    return *this;
+}
+
+SqlBinder &SqlBinder::operator<<(const std::string_view &str)
+{
+    auto obj = std::make_shared<std::string>(str.data(), str.length());
+    parameters_.push_back(obj->data());
+    lengths_.push_back(static_cast<int>(obj->length()));
     objs_.push_back(obj);
     ++parametersNumber_;
-    parameters_.push_back((char *)obj->c_str());
+    if (type_ == ClientType::PostgreSQL)
+    {
+        formats_.push_back(0);
+    }
+    else if (type_ == ClientType::Mysql)
+    {
+        formats_.push_back(MySqlString);
+    }
+    else if (type_ == ClientType::Sqlite3)
+    {
+        formats_.push_back(Sqlite3TypeText);
+    }
+    return *this;
+}
+
+SqlBinder &SqlBinder::operator<<(const std::string &str)
+{
+    auto obj = std::make_shared<std::string>(str);
+    objs_.push_back(obj);
+    ++parametersNumber_;
+    parameters_.push_back(obj->data());
     lengths_.push_back(static_cast<int>(obj->length()));
     if (type_ == ClientType::PostgreSQL)
     {
@@ -236,14 +310,20 @@ SqlBinder &SqlBinder::operator<<(double f)
         parameters_.push_back((char *)(obj.get()));
         return *this;
     }
-    return operator<<(std::to_string(f));
+
+#if defined(__cpp_lib_format)
+    return operator<<(std::format("{:.17g}", f));
+#else
+    std::stringstream ss;
+    ss << std::setprecision(17) << f;
+    return operator<<(ss.str());
+#endif
 }
 
-SqlBinder &SqlBinder::operator<<(std::nullptr_t nullp)
+SqlBinder &SqlBinder::operator<<(std::nullptr_t)
 {
-    (void)nullp;
     ++parametersNumber_;
-    parameters_.push_back(NULL);
+    parameters_.push_back(nullptr);
     lengths_.push_back(0);
     if (type_ == ClientType::PostgreSQL)
     {
@@ -291,7 +371,7 @@ SqlBinder &SqlBinder::operator<<(DefaultValue dv)
     else if (type_ == ClientType::Mysql)
     {
         ++parametersNumber_;
-        parameters_.push_back(NULL);
+        parameters_.push_back(nullptr);
         lengths_.push_back(0);
         formats_.push_back(DrogonDefaultValue);
     }
@@ -324,9 +404,8 @@ int SqlBinder::getMysqlTypeBySize(size_t size)
             return 0;
     }
 #else
+    static_cast<void>(size);
     LOG_FATAL << "Mysql is not supported!";
     exit(1);
-    return 0;
-    (void)(size);
 #endif
 }

@@ -36,7 +36,13 @@ class DbClientLockFree : public DbClient,
     DbClientLockFree(const std::string &connInfo,
                      trantor::EventLoop *loop,
                      ClientType type,
+#if LIBPQ_SUPPORTS_BATCH_MODE
+                     size_t connectionNumberPerLoop,
+                     bool autoBatch);
+#else
                      size_t connectionNumberPerLoop);
+#endif
+
     ~DbClientLockFree() noexcept override;
     void execSql(const char *sql,
                  size_t sqlLength,
@@ -49,15 +55,26 @@ class DbClientLockFree : public DbClient,
                      &&exceptCallback) override;
     std::shared_ptr<Transaction> newTransaction(
         const std::function<void(bool)> &commitCallback =
-            std::function<void(bool)>()) noexcept(false) override;
+            std::function<void(bool)>(),
+        TransactionType transType =
+            TransactionType::Deferred) noexcept(false) override;
     void newTransactionAsync(
         const std::function<void(const std::shared_ptr<Transaction> &)>
-            &callback) override;
+            &callback,
+        TransactionType transType = TransactionType::Deferred) override;
     bool hasAvailableConnections() const noexcept override;
+
     void setTimeout(double timeout) override
     {
         timeout_ = timeout;
     }
+
+    void setReconnectInterval(double interval) override
+    {
+        reconnectInterval_ = interval;
+    }
+
+    void closeAll() override;
 
   private:
     std::string connectionInfo_;
@@ -69,15 +86,19 @@ class DbClientLockFree : public DbClient,
     std::unordered_set<DbConnectionPtr> transSet_;
     std::deque<std::shared_ptr<SqlCmd>> sqlCmdBuffer_;
 
-    std::list<std::shared_ptr<
-        std::function<void(const std::shared_ptr<Transaction> &)>>>
-        transCallbacks_;
+    using TransCallbackEntry =
+        std::pair<std::shared_ptr<std::function<void(
+                      const std::shared_ptr<Transaction> &)>>,
+                  TransactionType>;
+    std::list<TransCallbackEntry> transCallbacks_;
 
     double timeout_{-1.0};
+    double reconnectInterval_{1.0};
 
     void makeTrans(
         const DbConnectionPtr &conn,
-        std::function<void(const std::shared_ptr<Transaction> &)> &&callback);
+        std::function<void(const std::shared_ptr<Transaction> &)> &&callback,
+        TransactionType transType = TransactionType::Deferred);
     void execSqlWithTimeout(
         const char *sql,
         size_t sqlLength,
@@ -90,6 +111,7 @@ class DbClientLockFree : public DbClient,
     void handleNewTask(const DbConnectionPtr &conn);
 #if LIBPQ_SUPPORTS_BATCH_MODE
     size_t connectionPos_{0};  // Used for pg batch mode.
+    bool autoBatch_{false};
 #endif
 };
 

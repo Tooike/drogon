@@ -38,8 +38,10 @@ void RedisClientManager::createRedisClients(
                 LOG_TRACE << "create fast redis client for the thread " << idx;
                 c = std::make_shared<RedisClientLockFree>(
                     trantor::InetAddress(redisInfo.addr_, redisInfo.port_),
+                    redisInfo.addr_,
                     redisInfo.connectionNumber_,
                     ioLoops[idx],
+                    redisInfo.username_,
                     redisInfo.password_,
                     redisInfo.db_);
                 if (redisInfo.timeout_ > 0.0)
@@ -52,7 +54,9 @@ void RedisClientManager::createRedisClients(
         {
             auto clientPtr = std::make_shared<RedisClientImpl>(
                 trantor::InetAddress(redisInfo.addr_, redisInfo.port_),
+                redisInfo.addr_,
                 redisInfo.connectionNumber_,
+                redisInfo.username_,
                 redisInfo.password_,
                 redisInfo.db_);
             if (redisInfo.timeout_ > 0.0)
@@ -68,6 +72,7 @@ void RedisClientManager::createRedisClients(
 void RedisClientManager::createRedisClient(const std::string &name,
                                            const std::string &addr,
                                            unsigned short port,
+                                           const std::string &username,
                                            const std::string &password,
                                            const size_t connectionNum,
                                            const bool isFast,
@@ -78,6 +83,7 @@ void RedisClientManager::createRedisClient(const std::string &name,
     info.name_ = name;
     info.addr_ = addr;
     info.port_ = port;
+    info.username_ = username;
     info.password_ = password;
     info.connectionNumber_ = connectionNum;
     info.isFast_ = isFast;
@@ -105,3 +111,25 @@ void RedisClientManager::createRedisClient(const std::string &name,
 //    }
 //    return true;
 //}
+
+RedisClientManager::~RedisClientManager()
+{
+    for (auto &pair : redisClientsMap_)
+    {
+        pair.second->closeAll();
+    }
+    for (auto &pair : redisFastClientsMap_)
+    {
+        pair.second.init([](RedisClientPtr &clientPtr, size_t index) {
+            // the main loop;
+            std::promise<void> p;
+            auto f = p.get_future();
+            drogon::getIOThreadStorageLoop(index)->runInLoop(
+                [&clientPtr, &p]() {
+                    clientPtr->closeAll();
+                    p.set_value();
+                });
+            f.get();
+        });
+    }
+}

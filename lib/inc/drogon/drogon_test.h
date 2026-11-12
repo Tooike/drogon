@@ -1,18 +1,15 @@
 #pragma once
 #include <trantor/utils/NonCopyable.h>
 #include <drogon/DrObject.h>
-#include <drogon/utils/string_view.h>
+#include <drogon/exports.h>
 
-#include <iostream>
-#include <set>
 #include <memory>
-#include <condition_variable>
 #include <mutex>
 #include <sstream>
 #include <atomic>
-#include <future>
-#include <iomanip>
+#include <string_view>
 #include <cstddef>
+
 /**
  * @brief Drogon Test is a minimal effort test framework developed because the
  * major C++ test frameworks doesn't handle async programs well. Drogon Test's
@@ -22,6 +19,14 @@ namespace drogon
 {
 namespace test
 {
+#if defined(_MSC_VER) && !defined(__clang__)
+#define DROGON_TEST_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define DROGON_TEST_NOINLINE __attribute__((noinline))
+#else
+#define DROGON_TEST_NOINLINE
+#endif
+
 #define TEST_CTX drogon_test_ctx_
 #define DROGON_TESTCASE_PREIX_ drtest__
 #define DROGON_TESTCASE_PREIX_STR_ "drtest__"
@@ -58,30 +63,13 @@ class Case;
 
 namespace internal
 {
-extern std::mutex mtxRegister;
-extern std::promise<void> allTestRan;
-extern std::mutex mtxTestStats;
-extern bool testHasPrinted;
-extern std::set<Case*> registeredTests;
-extern std::atomic<size_t> numAssertions;
-extern std::atomic<size_t> numCorrectAssertions;
-extern size_t numTestCases;
-extern std::atomic<size_t> numFailedTestCases;
-extern bool printSuccessfulTests;
-inline void registerCase(Case* test)
-{
-    std::unique_lock<std::mutex> l(mtxRegister);
-    registeredTests.insert(test);
-}
+DROGON_EXPORT extern std::atomic<size_t> numAssertions;
+DROGON_EXPORT extern std::atomic<size_t> numCorrectAssertions;
+DROGON_EXPORT extern std::atomic<size_t> numFailedTestCases;
+DROGON_EXPORT extern bool printSuccessfulTests;
 
-inline void unregisterCase(Case* test)
-{
-    std::unique_lock<std::mutex> l(mtxRegister);
-    registeredTests.erase(test);
-
-    if (registeredTests.empty())
-        allTestRan.set_value();
-}
+DROGON_EXPORT void registerCase(Case *test);
+DROGON_EXPORT void unregisterCase(Case *test);
 
 template <typename _Tp, typename dummy = void>
 struct is_printable : std::false_type
@@ -89,15 +77,14 @@ struct is_printable : std::false_type
 };
 
 template <typename _Tp>
-struct is_printable<_Tp,
-                    typename std::enable_if<
-                        std::is_same<decltype(std::cout << std::declval<_Tp>()),
-                                     std::ostream&>::value>::type>
-    : std::true_type
+struct is_printable<
+    _Tp,
+    std::enable_if_t<std::is_same_v<decltype(std::cout << std::declval<_Tp>()),
+                                    std::ostream &>>> : std::true_type
 {
 };
 
-inline std::string escapeString(const string_view sv)
+inline std::string escapeString(const std::string_view sv)
 {
     std::string result;
     result.reserve(sv.size());
@@ -125,89 +112,48 @@ inline std::string escapeString(const string_view sv)
     return result;
 }
 
-inline std::string prettifyString(const string_view sv, size_t maxLength = 120)
-{
-    if (sv.size() <= maxLength)
-        return "\"" + escapeString(sv) + "\"";
+DROGON_EXPORT std::string prettifyString(const std::string_view sv,
+                                         size_t maxLength = 120);
 
-    const std::string msg = "...\" (truncated)";
-    return "\"" + escapeString(sv.substr(0, maxLength)) + msg;
+template <typename... Args>
+inline void outputReason(Args &&...args)
+{
+    (std::cout << ... << std::forward<Args>(args));
 }
 
-namespace internal
+template <typename T>
+inline std::string attemptPrint(T &&v)
 {
-template <bool P>
-struct AttemptPrintViaStream
-{
-    template <typename T>
-    std::string operator()(const T& v)
-    {
-        return "{un-printable}";
-    }
-};
-
-template <>
-struct AttemptPrintViaStream<true>
-{
-    template <typename T>
-    std::string operator()(const T& v)
+    using Type = std::remove_cv_t<std::remove_reference_t<T>>;
+    if constexpr (std::is_same_v<Type, std::nullptr_t>)
+        return "nullptr";
+    else if constexpr (std::is_same_v<Type, char>)
+        return "'" + std::string(1, v) + "'";
+    else if constexpr (std::is_convertible_v<Type, std::string_view>)
+        return prettifyString(v);
+    else if constexpr (internal::is_printable<Type>::value)
     {
         std::stringstream ss;
         ss << v;
         return ss.str();
     }
-};
-
-struct StringPrinter
-{
-    std::string operator()(const string_view& v)
-    {
-        return prettifyString(v);
-    }
-};
-
-}  // namespace internal
-
-template <typename T>
-inline std::string attemptPrint(T&& v)
-{
-    using DefaultPrinter =
-        internal::AttemptPrintViaStream<is_printable<T>::value>;
-
-    // Poor man's if constexpr because SFINAE don't disambiguate between
-    // possible resolutions
-    return typename std::conditional<std::is_convertible<T, string_view>::value,
-                                     internal::StringPrinter,
-                                     DefaultPrinter>::type()(v);
+    return "{un-printable}";
 }
 
-// Specializations to reduce template construction
-template <>
-inline std::string attemptPrint(const std::nullptr_t& v)
-{
-    return "nullptr";
-}
-
-template <>
-inline std::string attemptPrint(const char& v)
-{
-    return "'" + std::string(1, v) + "'";
-}
-
-inline std::string stringifyFuncCall(const std::string& funcName)
+inline std::string stringifyFuncCall(const std::string &funcName)
 {
     return funcName + "()";
 }
 
-inline std::string stringifyFuncCall(const std::string& funcName,
-                                     const std::string& param1)
+inline std::string stringifyFuncCall(const std::string &funcName,
+                                     const std::string &param1)
 {
     return funcName + "(" + param1 + ")";
 }
 
-inline std::string stringifyFuncCall(const std::string& funcName,
-                                     const std::string& param1,
-                                     const std::string& param2)
+inline std::string stringifyFuncCall(const std::string &funcName,
+                                     const std::string &param1,
+                                     const std::string &param2)
 {
     return funcName + "(" + param1 + ", " + param2 + ")";
 }
@@ -226,93 +172,75 @@ struct ComparsionResult
 template <typename T>
 struct Lhs
 {
-    template <typename _ = void>  // HACK: prevent this function to be evaulated
+    template <typename _ = void>  // HACK: prevent this function to be evaluated
                                   // when not invoked
     std::pair<bool, std::string> result() const
     {
         return {(bool)ref_, attemptPrint(ref_)};
     }
 
-    Lhs(const T& lhs) : ref_(lhs)
+    Lhs(const T &lhs) : ref_(lhs)
     {
     }
-    const T& ref_;
 
-    template <typename RhsType>
-    ComparsionResult operator<(const RhsType& rhs)
-    {
-        return ComparsionResult{ref_ < rhs,
-                                attemptPrint(ref_) + " < " +
-                                    attemptPrint(ref_)};
+    const T &ref_;
+
+// Expression decomposition, one out-of-line instantiation per operand type
+// pair. Two properties matter for compile time and are easy to lose:
+//   * DROGON_TEST_NOINLINE - without it the whole stringification machinery
+//     is inlined into every assertion site.
+//   * the expansion string is only built when it will actually be shown.
+//     Building it unconditionally costs a formatting pass on every passing
+//     assertion, at run time as well as compile time.
+#define DROGON_TEST_DECOMPOSE_OP(op)                                      \
+    template <typename RhsType>                                           \
+    DROGON_TEST_NOINLINE ComparsionResult operator op(const RhsType &rhs) \
+    {                                                                     \
+        const bool result = ref_ op rhs;                                  \
+        if (result && !printSuccessfulTests)                              \
+            return ComparsionResult{result, std::string()};               \
+        return ComparsionResult{result,                                   \
+                                attemptPrint(ref_) + " " #op " " +        \
+                                    attemptPrint(rhs)};                   \
     }
 
-    template <typename RhsType>
-    ComparsionResult operator>(const RhsType& rhs)
-    {
-        return ComparsionResult{ref_ > rhs,
-                                attemptPrint(ref_) + " > " + attemptPrint(rhs)};
-    }
+    DROGON_TEST_DECOMPOSE_OP(<)
+    DROGON_TEST_DECOMPOSE_OP(>)
+    DROGON_TEST_DECOMPOSE_OP(<=)
+    DROGON_TEST_DECOMPOSE_OP(>=)
+    DROGON_TEST_DECOMPOSE_OP(==)
+    DROGON_TEST_DECOMPOSE_OP(!=)
+
+#undef DROGON_TEST_DECOMPOSE_OP
 
     template <typename RhsType>
-    ComparsionResult operator<=(const RhsType& rhs)
+    ComparsionResult operator&&(const RhsType &rhs)
     {
-        return ComparsionResult{ref_ <= rhs,
-                                attemptPrint(ref_) +
-                                    " <= " + attemptPrint(rhs)};
-    }
-
-    template <typename RhsType>
-    ComparsionResult operator>=(const RhsType& rhs)
-    {
-        return ComparsionResult{ref_ >= rhs,
-                                attemptPrint(ref_) +
-                                    " >= " + attemptPrint(rhs)};
-    }
-
-    template <typename RhsType>
-    ComparsionResult operator==(const RhsType& rhs)
-    {
-        return ComparsionResult{ref_ == rhs,
-                                attemptPrint(ref_) +
-                                    " == " + attemptPrint(rhs)};
-    }
-
-    template <typename RhsType>
-    ComparsionResult operator!=(const RhsType& rhs)
-    {
-        return ComparsionResult{ref_ != rhs,
-                                attemptPrint(ref_) +
-                                    " != " + attemptPrint(rhs)};
-    }
-
-    template <typename RhsType>
-    ComparsionResult operator&&(const RhsType& rhs)
-    {
-        static_assert(!std::is_same<RhsType, void>::value,
+        static_assert(!std::is_same_v<RhsType, void>,
                       " && is not supported in expression decomposition");
         return {};
     }
 
     template <typename RhsType>
-    ComparsionResult operator||(const RhsType& rhs)
+    ComparsionResult operator||(const RhsType &rhs)
     {
-        static_assert(!std::is_same<RhsType, void>::value,
+        static_assert(!std::is_same_v<RhsType, void>,
                       " || is not supported in expression decomposition");
         return {};
     }
 
     template <typename RhsType>
-    ComparsionResult operator|(const RhsType& rhs)
+    ComparsionResult operator|(const RhsType &rhs)
     {
-        static_assert(!std::is_same<RhsType, void>::value,
+        static_assert(!std::is_same_v<RhsType, void>,
                       " | is not supported in expression decomposition");
         return {};
     }
 
     template <typename RhsType>
-    ComparsionResult operator&(const RhsType& rhs)
+    ComparsionResult operator&(const RhsType &rhs)
     {
-        static_assert(!std::is_same<RhsType, void>::value,
+        static_assert(!std::is_same_v<RhsType, void>,
                       " & is not supported in expression decomposition");
         return {};
     }
@@ -321,7 +249,7 @@ struct Lhs
 struct Decomposer
 {
     template <typename T>
-    Lhs<T> operator<=(const T& other)
+    Lhs<T> operator<=(const T &other)
     {
         return Lhs<T>(other);
     }
@@ -329,10 +257,10 @@ struct Decomposer
 
 }  // namespace internal
 
-class ThreadSafeStream final
+class DROGON_EXPORT ThreadSafeStream final
 {
   public:
-    ThreadSafeStream(std::ostream& os) : os_(os)
+    ThreadSafeStream(std::ostream &os) : os_(os)
     {
         mtx_.lock();
     }
@@ -343,36 +271,32 @@ class ThreadSafeStream final
     }
 
     template <typename T>
-    std::ostream& operator<<(const T& rhs)
+    std::ostream &operator<<(const T &rhs)
     {
         return os_ << rhs;
     }
 
     static std::mutex mtx_;
-    std::ostream& os_;
+    std::ostream &os_;
 };
 
-inline ThreadSafeStream print()
-{
-    return ThreadSafeStream(std::cout);
-}
-
-inline ThreadSafeStream printErr()
-{
-    return ThreadSafeStream(std::cerr);
-}
+DROGON_EXPORT ThreadSafeStream print();
+DROGON_EXPORT ThreadSafeStream printErr();
 
 class CaseBase : public trantor::NonCopyable
 {
   public:
     CaseBase() = default;
-    CaseBase(const std::string& name) : name_(name)
+
+    CaseBase(const std::string &name) : name_(name)
     {
     }
-    CaseBase(std::shared_ptr<CaseBase> parent, const std::string& name)
+
+    CaseBase(std::shared_ptr<CaseBase> parent, const std::string &name)
         : parent_(parent), name_(name)
     {
     }
+
     virtual ~CaseBase() = default;
 
     std::string fullname() const
@@ -389,7 +313,7 @@ class CaseBase : public trantor::NonCopyable
         return result;
     }
 
-    const std::string& name() const
+    const std::string &name() const
     {
         return name_;
     }
@@ -414,15 +338,89 @@ class CaseBase : public trantor::NonCopyable
     std::string name_;
 };
 
+/// Out-of-line assertion reporting.
+///
+/// Each assertion macro would otherwise inline a cold `operator<<` message
+/// chain at every call site - up to four of them per assertion, counting the
+/// two exception handlers and the success message. In assertion-heavy test
+/// files that dominates compile time and object size.
+///
+/// Each of these acquires the output lock internally and holds it for exactly
+/// one statement, so no locked stream is ever handed across an API boundary.
+/// `funcName`/`expr` are `const char *` on purpose: taking `const std::string
+/// &` would construct two temporaries at every call site.
+DROGON_EXPORT void reportCheckFailure(const CaseBase &testCase,
+                                      const char *file,
+                                      int line,
+                                      const char *funcName,
+                                      const char *expr,
+                                      const std::string &expansion);
+DROGON_EXPORT void reportUnexpectedException(const CaseBase &testCase,
+                                             const char *file,
+                                             int line,
+                                             const char *funcName,
+                                             const char *expr,
+                                             const char *what);
+DROGON_EXPORT void reportUnknownException(const CaseBase &testCase,
+                                          const char *file,
+                                          int line,
+                                          const char *funcName,
+                                          const char *expr);
+DROGON_EXPORT void reportNoException(const CaseBase &testCase,
+                                     const char *file,
+                                     int line,
+                                     const char *funcName,
+                                     const char *expr);
+DROGON_EXPORT void reportUnwantedException(const CaseBase &testCase,
+                                           const char *file,
+                                           int line,
+                                           const char *funcName,
+                                           const char *expr);
+DROGON_EXPORT void reportBadExceptionType(const CaseBase &testCase,
+                                          const char *file,
+                                          int line,
+                                          const char *funcName,
+                                          const char *expr,
+                                          bool exceptionThrown,
+                                          const char *expectedType);
+
+/// Evaluates a decomposed comparison and reports a failure, out of line.
+/// Keeping the std::pair<bool, std::string> inside this function rather than at
+/// the call site is what stops every assertion from materialising a string (and
+/// its destructor and unwind paths) in the caller.
+template <typename CmpResult>
+DROGON_TEST_NOINLINE bool evalAndReport(const CaseBase &testCase,
+                                        const char *file,
+                                        int line,
+                                        const char *funcName,
+                                        const char *expr,
+                                        CmpResult &&cmp)
+{
+    const auto outcome = cmp.result();
+    if (!outcome.first)
+    {
+        reportCheckFailure(
+            testCase, file, line, funcName, expr, outcome.second);
+        return false;
+    }
+    return true;
+}
+
+DROGON_EXPORT void reportPassed(const CaseBase &testCase,
+                                const char *file,
+                                int line,
+                                const char *funcName,
+                                const char *expr);
+
 class Case : public CaseBase
 {
   public:
-    Case(const std::string& name) : CaseBase(name)
+    Case(const std::string &name) : CaseBase(name)
     {
         internal::registerCase(this);
     }
 
-    Case(std::shared_ptr<Case> parent, const std::string& name)
+    Case(std::shared_ptr<Case> parent, const std::string &name)
         : CaseBase(parent, name)
     {
         internal::registerCase(this);
@@ -436,226 +434,18 @@ class Case : public CaseBase
 
 struct TestCase : public CaseBase
 {
-    TestCase(const std::string& name) : CaseBase(name)
+    TestCase(const std::string &name) : CaseBase(name)
     {
     }
+
     virtual ~TestCase() = default;
     virtual void doTest_(std::shared_ptr<Case>) = 0;
 };
 
-void printTestStats();
-
-#ifdef DROGON_TEST_MAIN
-
-namespace internal
-{
-static std::string leftpad(const std::string& str, size_t len)
-{
-    if (len <= str.size())
-        return str;
-    return std::string(len - str.size(), ' ') + str;
-}
-}  // namespace internal
-
-static void printHelp(string_view argv0)
-{
-    print() << "A Drogon Test application:\n\n"
-            << "Usage: " << argv0 << " [options]\n"
-            << "options:\n"
-            << "    -r        Run a specific test\n"
-            << "    -s        Print successful tests\n"
-            << "    -l        List avaliable tests\n"
-            << "    -h        Print this help message\n";
-}
-
-void printTestStats()
-{
-    std::unique_lock<std::mutex> lk(internal::mtxTestStats);
-    if (internal::testHasPrinted)
-        return;
-    const size_t successAssertions = internal::numCorrectAssertions;
-    const size_t totalAssertions = internal::numAssertions;
-    const size_t successTests =
-        internal::numTestCases - internal::numFailedTestCases;
-    const size_t totalTests = internal::numTestCases;
-
-    float ratio;
-    if (totalAssertions != 0)
-        ratio = (float)successTests / totalTests;
-    else
-        ratio = 1;
-    const size_t barSize = 80;
-    size_t greenBar = barSize * ratio;
-    size_t redBar = barSize * (1 - ratio);
-    if (greenBar + redBar != barSize)
-    {
-        float fraction = (ratio * barSize) - (size_t)(ratio * barSize);
-        if (fraction >= 0.5f)
-            greenBar++;
-        else
-            redBar++;
-    }
-    if (successAssertions != totalAssertions && redBar == 0)
-    {
-        redBar = 1;
-        greenBar--;
-    }
-
-    print() << "\n\x1B[0;31m" << std::string(redBar, '=') << "\x1B[0;32m"
-            << std::string(greenBar, '=') << "\x1B[0m\n";
-
-    if (successAssertions == totalAssertions)
-    {
-        print() << "\x1B[1;32m  All tests passed\x1B[0m (" << totalAssertions
-                << " assertions in " << totalTests << " tests cases).\n";
-    }
-    else
-    {
-        std::string totalAssertsionStr = std::to_string(totalAssertions);
-        std::string successAssertionsStr = std::to_string(successAssertions);
-        std::string failedAssertsionStr =
-            std::to_string(totalAssertions - successAssertions);
-        std::string totalTestsStr = std::to_string(totalTests);
-        std::string successTestsStr = std::to_string(successTests);
-        std::string failedTestsStr = std::to_string(totalTests - successTests);
-        const size_t totalLen =
-            (std::max)(totalAssertsionStr.size(), totalTestsStr.size());
-        const size_t successLen =
-            (std::max)(successAssertionsStr.size(), successTestsStr.size());
-        const size_t failedLen =
-            (std::max)(failedAssertsionStr.size(), failedTestsStr.size());
-        using internal::leftpad;
-        print() << "assertions: " << leftpad(totalAssertsionStr, totalLen)
-                << " | \x1B[0;32m" << leftpad(successAssertionsStr, successLen)
-                << " passed\x1B[0m | \x1B[0;31m"
-                << leftpad(failedAssertsionStr, failedLen) << " failed\x1B[0m\n"
-                << "test cases: " << leftpad(totalTestsStr, totalLen)
-                << " | \x1B[0;32m" << leftpad(successTestsStr, successLen)
-                << " passed\x1B[0m | \x1B[0;31m"
-                << leftpad(failedTestsStr, failedLen) << " failed\x1B[0m\n";
-    }
-    internal::testHasPrinted = true;
-}
-
-static int run(int argc, char** argv)
-{
-    internal::numCorrectAssertions = 0;
-    internal::numAssertions = 0;
-    internal::numFailedTestCases = 0;
-    internal::numTestCases = 0;
-    internal::printSuccessfulTests = false;
-
-    std::string targetTest;
-    bool listTests = false;
-    for (int i = 1; i < argc; i++)
-    {
-        std::string param = argv[i];
-        if (param == "-r" && i + 1 < argc)
-        {
-            targetTest = argv[i + 1];
-            i++;
-        }
-        if (param == "-h")
-        {
-            printHelp(argv[0]);
-            exit(0);
-        }
-        if (param == "-s")
-        {
-            internal::printSuccessfulTests = true;
-        }
-        if (param == "-l")
-        {
-            listTests = true;
-        }
-    }
-    auto classNames = DrClassMap::getAllClassName();
-
-    if (listTests)
-    {
-        print() << "Avaliable Tests:\n";
-        for (const auto& name : classNames)
-        {
-            if (name.find(DROGON_TESTCASE_PREIX_STR_) == 0)
-            {
-                auto test =
-                    std::unique_ptr<DrObjectBase>(DrClassMap::newObject(name));
-                auto ptr = dynamic_cast<TestCase*>(test.get());
-                if (ptr == nullptr)
-                    continue;
-                print() << "  " << ptr->name() << "\n";
-            }
-        }
-        exit(0);
-    }
-
-    std::vector<std::shared_ptr<TestCase>> testCases;
-    // NOTE: Registering a dummy case prevents the test-end signal to be
-    // emited too early as there's always an case that hasn't finish
-    std::shared_ptr<Case> dummyCase = std::make_shared<Case>("__dummy_dummy_");
-    for (const auto& name : classNames)
-    {
-        if (name.find(DROGON_TESTCASE_PREIX_STR_) == 0)
-        {
-            auto obj =
-                std::shared_ptr<DrObjectBase>(DrClassMap::newObject(name));
-            auto test = std::dynamic_pointer_cast<TestCase>(obj);
-            if (test == nullptr)
-            {
-                LOG_WARN << "Class " << name
-                         << " seems to be a test case. But type information "
-                            "disagrees.";
-                continue;
-            }
-            if (targetTest.empty() || test->name() == targetTest)
-            {
-                internal::numTestCases++;
-                test->doTest_(std::make_shared<Case>(test->name()));
-                testCases.emplace_back(std::move(test));
-            }
-        }
-    }
-    dummyCase = {};
-
-    if (targetTest != "" && internal::numTestCases == 0)
-    {
-        printErr() << "Cannot find test named " << targetTest << "\n";
-        exit(1);
-    }
-
-    if (internal::registeredTests.empty() == false)
-    {
-        auto fut = internal::allTestRan.get_future();
-        fut.get();
-        assert(internal::registeredTests.empty());
-    }
-    testCases.clear();
-
-    printTestStats();
-
-    return internal::numCorrectAssertions != internal::numAssertions;
-}
-#endif
+DROGON_EXPORT void printTestStats();
+DROGON_EXPORT int run(int argc, char **argv);
 }  // namespace test
 }  // namespace drogon
-
-#define ERROR_MSG(func_name, expr)                                    \
-    drogon::test::printErr()                                          \
-        << "\x1B[1;37mIn test case " << TEST_CTX->fullname() << "\n"  \
-        << "\x1B[0;37m↳ " << __FILE__ << ":" << __LINE__              \
-        << " \x1B[0;31m FAILED:\x1B[0m\n"                             \
-        << "  \033[0;34m"                                             \
-        << drogon::test::internal::stringifyFuncCall(func_name, expr) \
-        << "\x1B[0m\n"
-
-#define PASSED_MSG(func_name, expr)                                   \
-    drogon::test::print()                                             \
-        << "\x1B[1;37mIn test case " << TEST_CTX->fullname() << "\n"  \
-        << "\x1B[0;37m↳ " << __FILE__ << ":" << __LINE__              \
-        << " \x1B[0;32m PASSED:\x1B[0m\n"                             \
-        << "  \033[0;34m"                                             \
-        << drogon::test::internal::stringifyFuncCall(func_name, expr) \
-        << "\x1B[0m\n"
 
 #define SET_TEST_SUCCESS__ \
     do                     \
@@ -679,8 +469,9 @@ static int run(int argc, char** argv)
         {                                                   \
             eval;                                           \
         }                                                   \
-        catch (const std::exception& e)                     \
+        catch (const std::exception &e)                     \
         {                                                   \
+            (void)e;                                        \
             on_exception;                                   \
         }                                                   \
         catch (...)                                         \
@@ -694,41 +485,35 @@ static int run(int argc, char** argv)
         on_leaving;                                         \
     } while (0);
 
-#define EVAL_AND_CHECK_TRUE__(func_name, expr)                       \
-    do                                                               \
-    {                                                                \
-        bool drresult__;                                             \
-        std::string drexpansion__;                                   \
-        DROGON_TEST_START_SUPRESSION_                                \
-        DROGON_TEST_SUPPRESS_PARENTHESES_WARNING_                    \
-        std::tie(drresult__, drexpansion__) =                        \
-            (drogon::test::internal::Decomposer() <= expr).result(); \
-        DROGON_TEST_END_SUPRESSION_                                  \
-        if (!drresult__)                                             \
-        {                                                            \
-            ERROR_MSG(func_name, #expr)                              \
-                << "With expansion\n"                                \
-                << "  \033[0;33m" << drexpansion__ << "\x1B[0m\n\n"; \
-        }                                                            \
-        else                                                         \
-            SET_TEST_SUCCESS__;                                      \
+#define EVAL_AND_CHECK_TRUE__(func_name, expr)                   \
+    do                                                           \
+    {                                                            \
+        DROGON_TEST_START_SUPRESSION_                            \
+        DROGON_TEST_SUPPRESS_PARENTHESES_WARNING_                \
+        if (drogon::test::evalAndReport(                         \
+                *TEST_CTX,                                       \
+                __FILE__,                                        \
+                __LINE__,                                        \
+                func_name,                                       \
+                #expr,                                           \
+                (drogon::test::internal::Decomposer() <= expr))) \
+            SET_TEST_SUCCESS__;                                  \
+        DROGON_TEST_END_SUPRESSION_                              \
     } while (0);
 
-#define PRINT_UNEXPECTED_EXCEPTION__(func_name, expr)         \
-    do                                                        \
-    {                                                         \
-        ERROR_MSG(func_name, expr)                            \
-            << "An unexpected exception is thrown. what():\n" \
-            << "  \033[0;33m" << e.what() << "\x1B[0m\n\n";   \
+#define PRINT_UNEXPECTED_EXCEPTION__(func_name, expr)                  \
+    do                                                                 \
+    {                                                                  \
+        drogon::test::reportUnexpectedException(                       \
+            *TEST_CTX, __FILE__, __LINE__, func_name, expr, e.what()); \
     } while (0);
 
 #define PRINT_PASSED__(func_name, expr)                                 \
     do                                                                  \
     {                                                                   \
         if (drogon::test::internal::printSuccessfulTests && TEST_FLAG_) \
-        {                                                               \
-            PASSED_MSG(func_name, expr) << "\n";                        \
-        }                                                               \
+            drogon::test::reportPassed(                                 \
+                *TEST_CTX, __FILE__, __LINE__, func_name, expr);        \
     } while (0);
 
 #define RETURN_ON_FAILURE__ \
@@ -757,11 +542,11 @@ static int run(int argc, char** argv)
         }                                                               \
     } while (0);
 
-#define PRINT_NONSTANDARD_EXCEPTION__(func_name, expr)        \
-    do                                                        \
-    {                                                         \
-        ERROR_MSG(func_name, expr)                            \
-            << "Unexpected unknown exception is thrown.\n\n"; \
+#define PRINT_NONSTANDARD_EXCEPTION__(func_name, expr)       \
+    do                                                       \
+    {                                                        \
+        drogon::test::reportUnknownException(                \
+            *TEST_CTX, __FILE__, __LINE__, func_name, expr); \
     } while (0);
 
 #define EVAL__(expr) \
@@ -774,24 +559,20 @@ static int run(int argc, char** argv)
     {             \
     }
 
-#define PRINT_ERR_NOEXCEPTION__(expr, func_name)                    \
-    do                                                              \
-    {                                                               \
-        if (!TEST_FLAG_)                                            \
-            ERROR_MSG(func_name, expr)                              \
-                << "With expecitation\n"                            \
-                << "  Expected to throw an exception. But non are " \
-                   "thrown.\n\n";                                   \
+#define PRINT_ERR_NOEXCEPTION__(expr, func_name)                 \
+    do                                                           \
+    {                                                            \
+        if (!TEST_FLAG_)                                         \
+            drogon::test::reportNoException(                     \
+                *TEST_CTX, __FILE__, __LINE__, func_name, expr); \
     } while (0);
 
-#define PRINT_ERR_WITHEXCEPTION__(expr, func_name)                   \
-    do                                                               \
-    {                                                                \
-        if (!TEST_FLAG_)                                             \
-            ERROR_MSG(func_name, expr)                               \
-                << "With expecitation\n"                             \
-                << "  Should to not throw an exception. But one is " \
-                   "thrown.\n\n";                                    \
+#define PRINT_ERR_WITHEXCEPTION__(expr, func_name)               \
+    do                                                           \
+    {                                                            \
+        if (!TEST_FLAG_)                                         \
+            drogon::test::reportUnwantedException(               \
+                *TEST_CTX, __FILE__, __LINE__, func_name, expr); \
     } while (0);
 
 #define PRINT_ERR_BAD_EXCEPTION__(                                             \
@@ -799,21 +580,14 @@ static int run(int argc, char** argv)
     do                                                                         \
     {                                                                          \
         assert((exceptionThrown && correctExceptionType) || !exceptionThrown); \
-        if (exceptionThrown == true && correctExceptionType == false)          \
-        {                                                                      \
-            ERROR_MSG(func_name, expr)                                         \
-                << "With expecitation\n"                                       \
-                << "  Exception have been throw but not of type \033[0;33m"    \
-                << #excep_type << "\033[0m.\n\n";                              \
-        }                                                                      \
-        else if (exceptionThrown == false)                                     \
-        {                                                                      \
-            ERROR_MSG(func_name, expr)                                         \
-                << "With expecitation\n"                                       \
-                << "  A \033[0;33m" << #excep_type                             \
-                << "\033[0m exception is expected. But nothing was thrown"     \
-                << "\033[0m.\n\n";                                             \
-        }                                                                      \
+        if (!(exceptionThrown) || !(correctExceptionType))                     \
+            drogon::test::reportBadExceptionType(*TEST_CTX,                    \
+                                                 __FILE__,                     \
+                                                 __LINE__,                     \
+                                                 func_name,                    \
+                                                 expr,                         \
+                                                 (exceptionThrown),            \
+                                                 #excep_type);                 \
     } while (0);
 
 #define CHECK_INTERNAL__(expr, func_name, on_leave)                      \
@@ -849,7 +623,7 @@ static int run(int argc, char** argv)
             EVAL__(expr),                                                     \
             {                                                                 \
                 exceptionThrown = true;                                       \
-                if (dynamic_cast<const except_type*>(&e) != nullptr)          \
+                if (dynamic_cast<const except_type *>(&e) != nullptr)         \
                     SET_TEST_SUCCESS__;                                       \
             },                                                                \
             { exceptionThrown = true; },                                      \
@@ -925,9 +699,9 @@ static int run(int argc, char** argv)
         drogon::test::internal::numAssertions++;        \
         static_assert((expr), #expr " failed.");        \
         drogon::test::internal::numCorrectAssertions++; \
-    } while (0);
+    } while (0)
 
-#define FAIL(message)                                                   \
+#define FAIL(...)                                                       \
     do                                                                  \
     {                                                                   \
         using namespace drogon::test;                                   \
@@ -936,14 +710,16 @@ static int run(int argc, char** argv)
                    << "\n"                                              \
                    << "\x1B[0;37m" << __FILE__ << ":" << __LINE__       \
                    << " \x1B[0;31m FAILED:\x1B[0m\n"                    \
-                   << "  Reason: " << message << "\n\n";                \
+                   << "  Reason: ";                                     \
+        drogon::test::internal::outputReason(__VA_ARGS__);              \
+        printErr() << "\n\n";                                           \
         drogon::test::internal::numAssertions++;                        \
     } while (0)
-#define FAULT(message)                                             \
+#define FAULT(...)                                                 \
     do                                                             \
     {                                                              \
         using namespace drogon::test;                              \
-        FAIL(message);                                             \
+        FAIL(__VA_ARGS__);                                         \
         printTestStats();                                          \
         printErr() << "Force exiting due to a FAULT statement.\n"; \
         exit(1);                                                   \
@@ -989,28 +765,3 @@ static int run(int argc, char** argv)
          ctx_tmp__ != nullptr;                                           \
          TEST_CTX = ctx_hold__, ctx_tmp__ = nullptr)                     \
         if (TEST_CTX = ctx_tmp__, TEST_CTX != nullptr)
-
-#ifdef DROGON_TEST_MAIN
-namespace drogon
-{
-namespace test
-{
-std::mutex ThreadSafeStream::mtx_;
-
-namespace internal
-{
-std::mutex mtxRegister;
-std::mutex mtxTestStats;
-bool testHasPrinted = false;
-std::set<Case*> registeredTests;
-std::promise<void> allTestRan;
-std::atomic<size_t> numAssertions;
-std::atomic<size_t> numCorrectAssertions;
-size_t numTestCases;
-std::atomic<size_t> numFailedTestCases;
-bool printSuccessfulTests;
-}  // namespace internal
-}  // namespace test
-}  // namespace drogon
-
-#endif

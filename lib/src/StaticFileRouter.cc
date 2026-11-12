@@ -16,77 +16,131 @@
 #include "HttpAppFrameworkImpl.h"
 #include "HttpRequestImpl.h"
 #include "HttpResponseImpl.h"
+#include "RangeParser.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <memory>
+#include <ctime>
 #include <fcntl.h>
 #ifndef _WIN32
 #include <sys/file.h>
 #elif !defined(__MINGW32__)
 #define stat _wstati64
-#define S_ISREG(m) (((m)&0170000) == (0100000))
-#define S_ISDIR(m) (((m)&0170000) == (0040000))
+#define S_ISREG(m) (((m) & 0170000) == (0100000))
+#define S_ISDIR(m) (((m) & 0170000) == (0040000))
 #endif
 #include <sys/stat.h>
-// Switch between native c++17 or boost for c++14
-#include "filesystem.h"
+#include <filesystem>
+#include <iterator>
 
 using namespace drogon;
 
-void StaticFileRouter::init(const std::vector<trantor::EventLoop *> &ioloops)
+// A trailing separator would leave an empty last element that never matches.
+static std::filesystem::path normalizedRoot(const std::string &dir)
 {
-    // Max timeout up to about 70 days;
-    staticFilesCacheMap_ = decltype(staticFilesCacheMap_)(
-        new IOThreadStorage<std::unique_ptr<CacheMap<std::string, char>>>);
-    staticFilesCacheMap_->init(
-        [&ioloops](std::unique_ptr<CacheMap<std::string, char>> &mapPtr,
-                   size_t i) {
-            assert(i == ioloops[i]->index());
-            mapPtr = std::unique_ptr<CacheMap<std::string, char>>(
-                new CacheMap<std::string, char>(ioloops[i], 1.0, 4, 50));
-        });
-    staticFilesCache_ = decltype(staticFilesCache_)(
-        new IOThreadStorage<
-            std::unordered_map<std::string, HttpResponsePtr>>{});
-    ioLocationsPtr_ =
-        decltype(ioLocationsPtr_)(new IOThreadStorage<std::vector<Location>>);
-    for (auto *loop : ioloops)
+    std::error_code err;
+    auto root = std::filesystem::absolute(utils::toNativePath(dir), err)
+                    .lexically_normal();
+    if (err)
     {
-        loop->queueInLoop([this] { **ioLocationsPtr_ = locations_; });
+        return {};
     }
+    if (!root.has_filename())
+    {
+        root = root.parent_path();
+    }
+    return root;
+}
+
+// Element-wise, so "/var/www2" is never taken as being under "/var/www".
+static bool isUnderRoot(const std::filesystem::path &root,
+                        const std::string &target)
+{
+    if (root.empty())
+    {
+        return false;
+    }
+    std::error_code err;
+    auto normalized =
+        std::filesystem::absolute(utils::toNativePath(target), err)
+            .lexically_normal();
+    if (err)
+    {
+        return false;
+    }
+    auto element = normalized.begin();
+    for (const auto &rootElement : root)
+    {
+        if (element == normalized.end() || *element != rootElement)
+        {
+            return false;
+        }
+        ++element;
+    }
+    return true;
+}
+
+// Files in sub directories are only reachable through recursive locations.
+static bool isInSubdirectory(const std::string &relativePath)
+{
+    auto normalized = std::filesystem::path(utils::toNativePath(relativePath))
+                          .lexically_normal()
+                          .relative_path();
+    return std::distance(normalized.begin(), normalized.end()) > 1;
+}
+
+void StaticFileRouter::init(const std::vector<trantor::EventLoop *> &ioLoops)
+{
+    documentRootPath_ =
+        normalizedRoot(HttpAppFrameworkImpl::instance().getDocumentRoot());
+    // Max timeout up to about 70 days;
+    staticFilesCacheMap_ = std::make_unique<
+        IOThreadStorage<std::unique_ptr<CacheMap<std::string, char>>>>();
+    staticFilesCacheMap_->init(
+        [&ioLoops](std::unique_ptr<CacheMap<std::string, char>> &mapPtr,
+                   size_t i) {
+            assert(i == ioLoops[i]->index());
+            mapPtr = std::make_unique<CacheMap<std::string, char>>(ioLoops[i],
+                                                                   1.0f,
+                                                                   4,
+                                                                   50);
+        });
+    staticFilesCache_ = std::make_unique<
+        IOThreadStorage<std::unordered_map<std::string, HttpResponsePtr>>>();
+    ioLocationsPtr_ =
+        std::make_shared<IOThreadStorage<std::vector<Location>>>();
+    for (auto *loop : ioLoops)
+    {
+        loop->queueInLoop(
+            [ioLocationsPtr = ioLocationsPtr_, locations = locations_] {
+                **ioLocationsPtr = locations;
+            });
+    }
+}
+
+void StaticFileRouter::reset()
+{
+    staticFilesCacheMap_.reset();
+    staticFilesCache_.reset();
+    ioLocationsPtr_.reset();
+    locations_.clear();
+    documentRootPath_.clear();
 }
 
 void StaticFileRouter::route(
     const HttpRequestImplPtr &req,
     std::function<void(const HttpResponsePtr &)> &&callback)
 {
+    // HttpServer has canonicalized path as this point. We are safe to use
+    // the provided path as is
     const std::string &path = req->path();
-    if (path.find("..") != std::string::npos)
-    {
-        auto directories = utils::splitString(path, "/");
-        int traversalDepth = 0;
-        for (const auto &dir : directories)
-        {
-            if (dir == "..")
-            {
-                traversalDepth--;
-            }
-            else if (dir != ".")
-            {
-                traversalDepth++;
-            }
-
-            if (traversalDepth < 0)
-            {
-                // Downloading files from the parent folder is forbidden.
-                callback(app().getCustomErrorHandler()(k403Forbidden));
-                return;
-            }
-        }
-    }
 
     auto lPath = path;
-    std::transform(lPath.begin(), lPath.end(), lPath.begin(), tolower);
+    std::transform(lPath.begin(),
+                   lPath.end(),
+                   lPath.begin(),
+                   [](unsigned char c) { return tolower(c); });
 
     for (auto &location : **ioLocationsPtr_)
     {
@@ -117,9 +171,13 @@ void StaticFileRouter::route(
             {
                 location.realLocation_.append(1, '/');
             }
+            location.rootPath_ = normalizedRoot(location.realLocation_);
             if (!location.isCaseSensitive_)
             {
-                std::transform(URI.begin(), URI.end(), URI.begin(), tolower);
+                std::transform(URI.begin(),
+                               URI.end(),
+                               URI.begin(),
+                               [](unsigned char c) { return tolower(c); });
             }
         }
         auto &tmpPath = location.isCaseSensitive_ ? path : lPath;
@@ -128,25 +186,29 @@ void StaticFileRouter::route(
                        tmpPath.begin() + URI.length(),
                        URI.begin()))
         {
-            string_view restOfThePath{path.data() + URI.length(),
-                                      path.length() - URI.length()};
-            auto pos = restOfThePath.rfind('/');
-            if (pos != 0 && pos != string_view::npos && !location.isRecursive_)
+            std::string_view restOfThePath{path.data() + URI.length(),
+                                           path.length() - URI.length()};
+            std::string relativePath{restOfThePath.data(),
+                                     restOfThePath.length()};
+            std::string filePath = location.realLocation_ + relativePath;
+            if (!isUnderRoot(location.rootPath_, filePath))
             {
-                callback(app().getCustomErrorHandler()(k403Forbidden));
+                callback(app().getCustomErrorHandler()(k403Forbidden, req));
                 return;
             }
-            std::string filePath =
-                location.realLocation_ +
-                std::string{restOfThePath.data(), restOfThePath.length()};
-            filesystem::path fsFilePath(utils::toNativePath(filePath));
-            drogon::error_code err;
-            if (!filesystem::exists(fsFilePath, err))
+            if (!location.isRecursive_ && isInSubdirectory(relativePath))
+            {
+                callback(app().getCustomErrorHandler()(k403Forbidden, req));
+                return;
+            }
+            std::filesystem::path fsFilePath(utils::toNativePath(filePath));
+            std::error_code err;
+            if (!std::filesystem::exists(fsFilePath, err))
             {
                 defaultHandler_(req, std::move(callback));
                 return;
             }
-            if (filesystem::is_directory(fsFilePath, err))
+            if (std::filesystem::is_directory(fsFilePath, err))
             {
                 // Check if path is eligible for an implicit index.html
                 if (implicitPageEnable_)
@@ -155,7 +217,7 @@ void StaticFileRouter::route(
                 }
                 else
                 {
-                    callback(app().getCustomErrorHandler()(k403Forbidden));
+                    callback(app().getCustomErrorHandler()(k403Forbidden, req));
                     return;
                 }
             }
@@ -163,10 +225,11 @@ void StaticFileRouter::route(
             {
                 if (!location.allowAll_)
                 {
-                    pos = restOfThePath.rfind('.');
-                    if (pos == string_view::npos)
+                    auto pos = restOfThePath.rfind('.');
+                    if (pos == std::string_view::npos)
                     {
-                        callback(app().getCustomErrorHandler()(k403Forbidden));
+                        callback(
+                            app().getCustomErrorHandler()(k403Forbidden, req));
                         return;
                     }
                     std::string extension{restOfThePath.data() + pos + 1,
@@ -174,55 +237,58 @@ void StaticFileRouter::route(
                     std::transform(extension.begin(),
                                    extension.end(),
                                    extension.begin(),
-                                   tolower);
+                                   [](unsigned char c) { return tolower(c); });
                     if (fileTypeSet_.find(extension) == fileTypeSet_.end())
                     {
-                        callback(app().getCustomErrorHandler()(k403Forbidden));
+                        callback(
+                            app().getCustomErrorHandler()(k403Forbidden, req));
                         return;
                     }
                 }
             }
 
-            if (location.filters_.empty())
+            if (location.middlewares_.empty())
             {
                 sendStaticFileResponse(filePath,
                                        req,
                                        std::move(callback),
-                                       string_view{
+                                       std::string_view{
                                            location.defaultContentType_});
             }
             else
             {
-                auto callbackPtr = std::make_shared<
-                    std::function<void(const drogon::HttpResponsePtr &)>>(
-                    std::move(callback));
-                filters_function::doFilters(
-                    location.filters_,
+                middlewares_function::passMiddlewares(
+                    location.middlewares_,
                     req,
-                    callbackPtr,
-                    [callbackPtr,
-                     this,
+                    std::move(callback),
+                    [this,
                      req,
                      filePath = std::move(filePath),
-                     &contentType = location.defaultContentType_]() {
+                     contentType =
+                         std::string_view{location.defaultContentType_}](
+                        std::function<void(const HttpResponsePtr &)>
+                            &&middlewarePostCb) mutable {
                         sendStaticFileResponse(filePath,
                                                req,
-                                               std::move(*callbackPtr),
-                                               string_view{contentType});
+                                               std::move(middlewarePostCb),
+                                               contentType);
                     });
             }
-
             return;
         }
     }
-
     std::string directoryPath =
         HttpAppFrameworkImpl::instance().getDocumentRoot() + path;
-    filesystem::path fsDirectoryPath(utils::toNativePath(directoryPath));
-    drogon::error_code err;
-    if (filesystem::exists(fsDirectoryPath, err))
+    if (!isUnderRoot(documentRootPath_, directoryPath))
     {
-        if (filesystem::is_directory(fsDirectoryPath, err))
+        callback(app().getCustomErrorHandler()(k403Forbidden, req));
+        return;
+    }
+    std::filesystem::path fsDirectoryPath(utils::toNativePath(directoryPath));
+    std::error_code err;
+    if (std::filesystem::exists(fsDirectoryPath, err))
+    {
+        if (std::filesystem::is_directory(fsDirectoryPath, err))
         {
             // Check if path is eligible for an implicit index.html
             if (implicitPageEnable_)
@@ -233,7 +299,7 @@ void StaticFileRouter::route(
             }
             else
             {
-                callback(app().getCustomErrorHandler()(k403Forbidden));
+                callback(app().getCustomErrorHandler()(k403Forbidden, req));
                 return;
             }
         }
@@ -243,7 +309,7 @@ void StaticFileRouter::route(
             auto pos = path.rfind('.');
             if (pos == std::string::npos)
             {
-                callback(app().getCustomErrorHandler()(k403Forbidden));
+                callback(app().getCustomErrorHandler()(k403Forbidden, req));
                 return;
             }
             std::string filetype = lPath.substr(pos + 1);
@@ -259,34 +325,241 @@ void StaticFileRouter::route(
     defaultHandler_(req, std::move(callback));
 }
 
+// Expand this struct as you need, nothing to worry about
+struct FileStat
+{
+    size_t fileSize_;
+    struct tm modifiedTime_;
+    std::string modifiedTimeStr_;
+};
+
+// A wrapper to call stat()
+// std::filesystem::file_time_type::clock::to_time_t still not
+// implemented by M$, even in c++20, so keep calls to stat()
+static bool getFileStat(const std::string &filePath, FileStat &myStat)
+{
+#if defined(_WIN32) && !defined(__MINGW32__)
+    struct _stati64 fileStat;
+#else   // _WIN32
+    struct stat fileStat;
+#endif  // _WIN32
+    if (stat(utils::toNativePath(filePath).c_str(), &fileStat) == 0 &&
+        S_ISREG(fileStat.st_mode))
+    {
+        LOG_TRACE << "last modify time:" << fileStat.st_mtime;
+#ifdef _WIN32
+        gmtime_s(&myStat.modifiedTime_, &fileStat.st_mtime);
+#else
+        gmtime_r(&fileStat.st_mtime, &myStat.modifiedTime_);
+#endif
+        std::string &timeStr = myStat.modifiedTimeStr_;
+        timeStr.resize(64);
+        size_t len = strftime((char *)timeStr.data(),
+                              timeStr.size(),
+                              "%a, %d %b %Y %H:%M:%S GMT",
+                              &myStat.modifiedTime_);
+        timeStr.resize(len);
+
+        myStat.fileSize_ = fileStat.st_size;
+        return true;
+    }
+
+    return false;
+}
+
 void StaticFileRouter::sendStaticFileResponse(
     const std::string &filePath,
     const HttpRequestImplPtr &req,
     std::function<void(const HttpResponsePtr &)> &&callback,
-    const string_view &defaultContentType)
-{  // find cached response
-    HttpResponsePtr cachedResp;
-    auto &cacheMap = staticFilesCache_->getThreadData();
-    auto iter = cacheMap.find(filePath);
-    if (iter != cacheMap.end())
+    const std::string_view &defaultContentType)
+{
+    if (req->method() != Get)
     {
-        cachedResp = iter->second;
+        callback(app().getCustomErrorHandler()(k405MethodNotAllowed, req));
+        return;
     }
 
-    // check last modified time,rfc2616-14.25
-    // If-Modified-Since: Mon, 15 Oct 2018 06:26:33 GMT
+    const auto addVary = [this](const HttpResponsePtr &response) {
+        for (const auto &header : headers_)
+        {
+            if (header.first.size() == 4 &&
+                std::equal(header.first.begin(),
+                           header.first.end(),
+                           "vary",
+                           [](unsigned char c, char expected) {
+                               return std::tolower(c) == expected;
+                           }))
+            {
+                response->addHeader(header.first, header.second);
+            }
+        }
+        if (brStaticFlag_ || gzipStaticFlag_)
+        {
+            const auto &vary = response->getHeader("vary");
+            if (vary != "*")
+            {
+                response->addHeader("Vary",
+                                    vary.empty() ? "Accept-Encoding"
+                                                 : vary + ", Accept-Encoding");
+            }
+        }
+    };
 
-    std::string timeStr;
-    bool fileExists{false};
+    FileStat fileStat;
+    bool fileExists = false;
+    const std::string &rangeStr = req->getHeaderBy("range");
+    if (enableRange_ && !rangeStr.empty())
+    {
+        if (!getFileStat(filePath, fileStat))
+        {
+            defaultHandler_(req, std::move(callback));
+            return;
+        }
+        fileExists = true;
+        // Check last modified time, rfc2616-14.25
+        // If-Modified-Since: Mon, 15 Oct 2018 06:26:33 GMT
+        // According to rfc 7233-3.1, preconditions must be evaluated before
+        const std::string &modiStr = req->getHeaderBy("if-modified-since");
+        if (enableLastModify_ && modiStr == fileStat.modifiedTimeStr_)
+        {
+            LOG_TRACE << "Not modified!";
+            std::shared_ptr<HttpResponseImpl> resp =
+                std::make_shared<HttpResponseImpl>();
+            resp->setStatusCode(k304NotModified);
+            resp->setContentTypeCode(CT_NONE);
+            addVary(resp);
+            callback(resp);
+            return;
+        }
+        // Check If-Range precondition
+        const std::string &ifRange = req->getHeaderBy("if-range");
+        if (ifRange.empty() || ifRange == fileStat.modifiedTimeStr_)
+        {
+            std::vector<FileRange> ranges;
+            switch (parseRangeHeader(rangeStr, fileStat.fileSize_, ranges))
+            {
+                // TODO: support only single range now
+                // Contributions are welcomed.
+                case FileRangeParseResult::SinglePart:
+                case FileRangeParseResult::MultiPart:
+                {
+                    auto firstRange = ranges.front();
+                    auto ct = fileNameToContentTypeAndMime(filePath);
+                    auto resp =
+                        HttpResponse::newFileResponse(filePath,
+                                                      firstRange.start,
+                                                      firstRange.end -
+                                                          firstRange.start,
+                                                      true,
+                                                      "",
+                                                      ct.first,
+                                                      std::string(ct.second),
+                                                      req);
+                    if (!fileStat.modifiedTimeStr_.empty())
+                    {
+                        resp->addHeader("Last-Modified",
+                                        fileStat.modifiedTimeStr_);
+                        if (staticFilesCacheTime_ > 0)
+                        {
+                            time_t expiry =
+                                time(nullptr) +
+                                static_cast<time_t>(staticFilesCacheTime_);
+                            struct tm expiryTm;
+#ifdef _WIN32
+                            gmtime_s(&expiryTm, &expiry);
+#else
+                            gmtime_r(&expiry, &expiryTm);
+#endif
+                            char buf[64];
+                            size_t len = strftime(buf,
+                                                  sizeof(buf),
+                                                  "%a, %d %b %Y %H:%M:%S GMT",
+                                                  &expiryTm);
+                            resp->addHeader("Expires", std::string(buf, len));
+                        }
+                    }
+                    callback(resp);
+                    return;
+                }
+                case FileRangeParseResult::NotSatisfiable:
+                {
+                    auto resp = HttpResponse::newHttpResponse();
+                    resp->setStatusCode(k416RequestedRangeNotSatisfiable);
+                    char buf[64];
+                    snprintf(buf,
+                             sizeof(buf),
+                             "bytes */%zu",
+                             fileStat.fileSize_);
+                    resp->addHeader("Content-Range", std::string(buf));
+                    callback(resp);
+                    return;
+                }
+                /** rfc7233 4.4.
+                 * > Note: Because servers are free to ignore Range, many
+                 * implementations will simply respond with the entire selected
+                 * representation in a 200 (OK) response.  That is partly
+                 * because most clients are prepared to receive a 200 (OK) to
+                 * complete the task (albeit less efficiently) and partly
+                 * because clients might not stop making an invalid partial
+                 * request until they have received a complete representation.
+                 * Thus, clients cannot depend on receiving a 416 (Range Not
+                 * Satisfiable) response even when it is most appropriate.
+                 */
+                default:
+                    break;
+            }
+        }
+    }
+
+    auto selectedFilePath = filePath;
+    std::string contentEncoding;
+    HttpResponsePtr cachedResp;
+    auto &cacheMap = staticFilesCache_->getThreadData();
+    const auto findCachedResponse = [&](const std::string &encoding) {
+        auto iter = cacheMap.find(encoding + '|' + filePath);
+        if (iter == cacheMap.end())
+        {
+            return false;
+        }
+        cachedResp = iter->second;
+        return true;
+    };
+    const auto &acceptEncoding = req->getHeaderBy("accept-encoding");
+    const auto selectCompressedFile = [&](const char *encoding,
+                                          const char *extension) {
+        if (acceptEncoding.find(encoding) == std::string::npos)
+        {
+            return false;
+        }
+        // Only probe the filesystem when this representation is not cached.
+        if (findCachedResponse(encoding))
+        {
+            contentEncoding = encoding;
+            return true;
+        }
+        auto compressedFilePath = filePath + extension;
+        std::error_code err;
+        if (!std::filesystem::is_regular_file(
+                utils::toNativePath(compressedFilePath), err))
+        {
+            return false;
+        }
+        selectedFilePath = std::move(compressedFilePath);
+        contentEncoding = encoding;
+        return true;
+    };
+    if (!(brStaticFlag_ && selectCompressedFile("br", ".br")) &&
+        !(gzipStaticFlag_ && selectCompressedFile("gzip", ".gz")))
+    {
+        findCachedResponse("");
+    }
+    // Prefixing is safe here
+    const auto cacheKey = contentEncoding + '|' + filePath;
+
     if (enableLastModify_)
     {
         if (cachedResp)
         {
-            if (req->method() != Get)
-            {
-                callback(app().getCustomErrorHandler()(k405MethodNotAllowed));
-                return;
-            }
             if (static_cast<HttpResponseImpl *>(cachedResp.get())
                     ->getHeaderBy("last-modified") ==
                 req->getHeaderBy("if-modified-since"))
@@ -295,143 +568,59 @@ void StaticFileRouter::sendStaticFileResponse(
                     std::make_shared<HttpResponseImpl>();
                 resp->setStatusCode(k304NotModified);
                 resp->setContentTypeCode(CT_NONE);
-                HttpAppFrameworkImpl::instance().callCallback(req,
-                                                              resp,
-                                                              callback);
+                addVary(resp);
+                callback(resp);
                 return;
             }
         }
         else
         {
             LOG_TRACE << "enabled LastModify";
-            // std::filesystem::file_time_type::clock::to_time_t still not
-            // implemented by M$, even in c++20, so keep calls to stat()
-#if defined(_WIN32) && !defined(__MINGW32__)
-            struct _stati64 fileStat;
-#else   // _WIN32
-            struct stat fileStat;
-#endif  // _WIN32
-            if (stat(utils::toNativePath(filePath).c_str(), &fileStat) == 0 &&
-                S_ISREG(fileStat.st_mode))
-            {
-                fileExists = true;
-                LOG_TRACE << "last modify time:" << fileStat.st_mtime;
-                if (req->method() != Get)
-                {
-                    callback(
-                        app().getCustomErrorHandler()(k405MethodNotAllowed));
-                    return;
-                }
-                struct tm tm1;
-#ifdef _WIN32
-                gmtime_s(&tm1, &fileStat.st_mtime);
-#else
-                gmtime_r(&fileStat.st_mtime, &tm1);
-#endif
-                timeStr.resize(64);
-                auto len = strftime((char *)timeStr.data(),
-                                    timeStr.size(),
-                                    "%a, %d %b %Y %H:%M:%S GMT",
-                                    &tm1);
-                timeStr.resize(len);
-                const std::string &modiStr =
-                    req->getHeaderBy("if-modified-since");
-                if (modiStr == timeStr && !modiStr.empty())
-                {
-                    LOG_TRACE << "not Modified!";
-                    std::shared_ptr<HttpResponseImpl> resp =
-                        std::make_shared<HttpResponseImpl>();
-                    resp->setStatusCode(k304NotModified);
-                    resp->setContentTypeCode(CT_NONE);
-                    HttpAppFrameworkImpl::instance().callCallback(req,
-                                                                  resp,
-                                                                  callback);
-                    return;
-                }
-            }
-            else
+            if (!fileExists && !getFileStat(filePath, fileStat))
             {
                 defaultHandler_(req, std::move(callback));
+                return;
+            }
+            fileExists = true;
+            const std::string &modiStr = req->getHeaderBy("if-modified-since");
+            if (modiStr == fileStat.modifiedTimeStr_)
+            {
+                LOG_TRACE << "not Modified!";
+                std::shared_ptr<HttpResponseImpl> resp =
+                    std::make_shared<HttpResponseImpl>();
+                resp->setStatusCode(k304NotModified);
+                resp->setContentTypeCode(CT_NONE);
+                addVary(resp);
+                callback(resp);
                 return;
             }
         }
     }
     if (cachedResp)
     {
-        if (req->method() != Get)
-        {
-            callback(app().getCustomErrorHandler()(k405MethodNotAllowed));
-            return;
-        }
         LOG_TRACE << "Using file cache";
-        HttpAppFrameworkImpl::instance().callCallback(req,
-                                                      cachedResp,
-                                                      callback);
+        callback(cachedResp);
         return;
     }
+    // Check existence
     if (!fileExists)
     {
-        filesystem::path fsFilePath(utils::toNativePath(filePath));
-        drogon::error_code err;
-        if (!filesystem::exists(fsFilePath, err) ||
-            !filesystem::is_regular_file(fsFilePath, err))
+        std::filesystem::path fsFilePath(utils::toNativePath(filePath));
+        std::error_code err;
+        if (!std::filesystem::exists(fsFilePath, err) ||
+            !std::filesystem::is_regular_file(fsFilePath, err))
         {
             defaultHandler_(req, std::move(callback));
             return;
         }
     }
 
-    if (req->method() != Get)
+    auto ct = fileNameToContentTypeAndMime(filePath);
+    auto resp = HttpResponse::newFileResponse(
+        selectedFilePath, "", ct.first, std::string(ct.second), req);
+    if (!contentEncoding.empty())
     {
-        callback(app().getCustomErrorHandler()(k405MethodNotAllowed));
-        return;
-    }
-
-    HttpResponsePtr resp;
-    auto &acceptEncoding = req->getHeaderBy("accept-encoding");
-
-    if (brStaticFlag_ && acceptEncoding.find("br") != std::string::npos)
-    {
-        // Find compressed file first.
-        auto brFileName = filePath + ".br";
-        filesystem::path fsBrFile(utils::toNativePath(brFileName));
-        drogon::error_code err;
-        if (filesystem::exists(fsBrFile, err) &&
-            filesystem::is_regular_file(fsBrFile, err))
-        {
-            auto ct = fileNameToContentTypeAndMime(filePath);
-            resp = HttpResponse::newFileResponse(brFileName,
-                                                 "",
-                                                 ct.first,
-                                                 std::string(ct.second));
-            resp->addHeader("Content-Encoding", "br");
-        }
-    }
-    if (!resp && gzipStaticFlag_ &&
-        acceptEncoding.find("gzip") != std::string::npos)
-    {
-        // Find compressed file first.
-        auto gzipFileName = filePath + ".gz";
-        filesystem::path fsGzipFile(utils::toNativePath(gzipFileName));
-        drogon::error_code err;
-        if (filesystem::exists(fsGzipFile, err) &&
-            filesystem::is_regular_file(fsGzipFile, err))
-        {
-            auto ct = fileNameToContentTypeAndMime(filePath);
-            resp = HttpResponse::newFileResponse(gzipFileName,
-                                                 "",
-                                                 ct.first,
-                                                 std::string(ct.second));
-            resp->addHeader("Content-Encoding", "gzip");
-        }
-    }
-    if (!resp)
-    {
-        auto ct = fileNameToContentTypeAndMime(filePath);
-        resp = HttpResponse::newFileResponse(filePath,
-                                             "",
-                                             ct.first,
-                                             std::string(ct.second));
+        resp->addHeader("Content-Encoding", contentEncoding);
     }
     if (resp->statusCode() != k404NotFound)
     {
@@ -441,10 +630,30 @@ void StaticFileRouter::sendStaticFileResponse(
             resp->setContentTypeCodeAndCustomString(CT_CUSTOM,
                                                     defaultContentType);
         }
-        if (!timeStr.empty())
+        if (!fileStat.modifiedTimeStr_.empty())
         {
-            resp->addHeader("Last-Modified", timeStr);
-            resp->addHeader("Expires", "Thu, 01 Jan 1970 00:00:00 GMT");
+            resp->addHeader("Last-Modified", fileStat.modifiedTimeStr_);
+            if (staticFilesCacheTime_ > 0)
+            {
+                time_t expiry =
+                    time(nullptr) + static_cast<time_t>(staticFilesCacheTime_);
+                struct tm expiryTm;
+#ifdef _WIN32
+                gmtime_s(&expiryTm, &expiry);
+#else
+                gmtime_r(&expiry, &expiryTm);
+#endif
+                char buf[64];
+                size_t len = strftime(buf,
+                                      sizeof(buf),
+                                      "%a, %d %b %Y %H:%M:%S GMT",
+                                      &expiryTm);
+                resp->addHeader("Expires", std::string(buf, len));
+            }
+        }
+        if (enableRange_)
+        {
+            resp->addHeader("accept-range", "bytes");
         }
         if (!headers_.empty())
         {
@@ -453,27 +662,28 @@ void StaticFileRouter::sendStaticFileResponse(
                 resp->addHeader(header.first, header.second);
             }
         }
+        addVary(resp);
         // cache the response for 5 seconds by default
         if (staticFilesCacheTime_ >= 0)
         {
             LOG_TRACE << "Save in cache for " << staticFilesCacheTime_
                       << " seconds";
             resp->setExpiredTime(staticFilesCacheTime_);
-            staticFilesCache_->getThreadData()[filePath] = resp;
+            staticFilesCache_->getThreadData()[cacheKey] = resp;
             staticFilesCacheMap_->getThreadData()->insert(
-                filePath, 0, staticFilesCacheTime_, [this, filePath]() {
+                cacheKey, 0, staticFilesCacheTime_, [this, cacheKey]() {
                     LOG_TRACE << "Erase cache";
-                    assert(staticFilesCache_->getThreadData().find(filePath) !=
+                    assert(staticFilesCache_->getThreadData().find(cacheKey) !=
                            staticFilesCache_->getThreadData().end());
-                    staticFilesCache_->getThreadData().erase(filePath);
+                    staticFilesCache_->getThreadData().erase(cacheKey);
                 });
         }
-        HttpAppFrameworkImpl::instance().callCallback(req, resp, callback);
+        callback(resp);
         return;
     }
     callback(resp);
-    return;
 }
+
 void StaticFileRouter::setFileTypes(const std::vector<std::string> &types)
 {
     fileTypeSet_.clear();
@@ -482,9 +692,10 @@ void StaticFileRouter::setFileTypes(const std::vector<std::string> &types)
         fileTypeSet_.insert(type);
     }
 }
+
 void StaticFileRouter::defaultHandler(
-    const HttpRequestPtr & /*req*/,
+    const HttpRequestPtr &req,
     std::function<void(const HttpResponsePtr &)> &&callback)
 {
-    callback(HttpResponse::newNotFoundResponse());
+    callback(HttpResponse::newNotFoundResponse(req));
 }

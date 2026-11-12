@@ -21,6 +21,7 @@
 #include <trantor/utils/NonCopyable.h>
 
 #include <memory>
+#include <atomic>
 #include <string>
 
 namespace drogon
@@ -51,6 +52,11 @@ class WebSocketClientImpl
     void connectToServer(const HttpRequestPtr &request,
                          const WebSocketRequestCallback &callback) override;
 
+    void setCertPath(const std::string &cert, const std::string &key) override;
+
+    void addSSLConfigs(const std::vector<std::pair<std::string, std::string>>
+                           &sslConfCmds) override;
+
     trantor::EventLoop *getLoop() override
     {
         return loop_;
@@ -80,9 +86,12 @@ class WebSocketClientImpl
     bool useOldTLS_{false};
     bool validateCert_{true};
     bool upgraded_{false};
-    bool stop_{false};
+    std::atomic<bool> stop_{false};
     std::string wsKey_;
     std::string wsAccept_;
+    std::string clientCertPath_;
+    std::string clientKeyPath_;
+    std::vector<std::pair<std::string, std::string>> sslConfCmds_;
 
     HttpRequestPtr upgradeRequest_;
     std::function<void(std::string &&,

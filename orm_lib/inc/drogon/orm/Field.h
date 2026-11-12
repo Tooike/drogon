@@ -18,7 +18,7 @@
 #pragma once
 
 #include <drogon/exports.h>
-#include <drogon/utils/string_view.h>
+#include <string_view>
 #include <drogon/orm/ArrayParser.h>
 #include <drogon/orm/Result.h>
 #include <drogon/orm/Row.h>
@@ -64,6 +64,47 @@ class DROGON_EXPORT Field
     size_t length() const
     {
         return result_.getLength(row_, column_);
+    }
+
+    SqlType sqlType() const noexcept
+    {
+        return result_.getSqlType(column_);
+    }
+
+    /// Native database type name (VARCHAR, INT, DECIMAL, TINYINT, BIT, etc.)
+    const std::string &nativeTypeName() const noexcept
+    {
+        return result_.getNativeTypeName(column_);
+    }
+
+    /// Character length (VARCHAR)
+    int columnLength() const noexcept
+    {
+        return result_.getColumnLength(column_);
+    }
+
+    /// Numeric precision (DECIMAL / NUMERIC)
+    int precision() const noexcept
+    {
+        return result_.getPrecision(column_);
+    }
+
+    /// Numeric scale (DECIMAL / NUMERIC)
+    int scale() const noexcept
+    {
+        return result_.getScale(column_);
+    }
+
+    /// Is this column nullable?
+    bool isNullable() const noexcept
+    {
+        return result_.isNullable(column_);
+    }
+
+    /// Is this column unsigned?
+    bool isUnsigned() const noexcept
+    {
+        return result_.isUnsigned(column_);
     }
 
     /// Convert to a type T value
@@ -118,6 +159,7 @@ class DROGON_EXPORT Field
     {
         return ArrayParser(result_.getValue(row_, column_));
     }
+
     template <typename T>
     std::vector<std::shared_ptr<T>> asArray() const
     {
@@ -159,6 +201,7 @@ class DROGON_EXPORT Field
   private:
     const Result result_;
 };
+
 template <>
 DROGON_EXPORT std::string Field::as<std::string>() const;
 template <>
@@ -167,12 +210,13 @@ template <>
 DROGON_EXPORT char *Field::as<char *>() const;
 template <>
 DROGON_EXPORT std::vector<char> Field::as<std::vector<char>>() const;
+
 template <>
-inline drogon::string_view Field::as<drogon::string_view>() const
+inline std::string_view Field::as<std::string_view>() const
 {
     auto first = result_.getValue(row_, column_);
     auto length = result_.getLength(row_, column_);
-    return drogon::string_view(first, length);
+    return {first, length};
 }
 
 template <>
@@ -225,7 +269,7 @@ inline int8_t Field::as<int8_t>() const
 {
     if (isNull())
         return 0;
-    return atoi(result_.getValue(row_, column_));
+    return static_cast<int8_t>(atoi(result_.getValue(row_, column_)));
 }
 
 template <>
@@ -242,7 +286,7 @@ inline unsigned int Field::as<unsigned int>() const
     if (isNull())
         return 0;
     return static_cast<unsigned int>(
-        std::stoi(result_.getValue(row_, column_)));
+        std::stoul(result_.getValue(row_, column_)));
 }
 
 template <>

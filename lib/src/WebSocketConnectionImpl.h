@@ -16,6 +16,8 @@
 
 #include "impl_forwards.h"
 #include <drogon/WebSocketConnection.h>
+#include <json/value.h>
+#include <string_view>
 #include <trantor/utils/NonCopyable.h>
 #include <trantor/net/TcpConnection.h>
 
@@ -27,20 +29,24 @@ using WebSocketConnectionImplPtr = std::shared_ptr<WebSocketConnectionImpl>;
 class WebSocketMessageParser
 {
   public:
-    bool parse(trantor::MsgBuffer *buffer);
+    bool parse(trantor::MsgBuffer *buffer, bool isServer = true);
+
     bool gotAll(std::string &message, WebSocketMessageType &type)
     {
         assert(message.empty());
         if (!gotAll_)
             return false;
-        message.swap(message_);
-        type = type_;
+        message.swap(completedMessage_);
+        type = completedType_;
         return true;
     }
 
   private:
     std::string message_;
-    WebSocketMessageType type_;
+    WebSocketMessageType type_{WebSocketMessageType::Unknown};
+    bool fragmented_{false};
+    std::string completedMessage_;
+    WebSocketMessageType completedType_{WebSocketMessageType::Unknown};
     bool gotAll_{false};
 };
 
@@ -59,7 +65,10 @@ class WebSocketConnectionImpl final
         uint64_t len,
         const WebSocketMessageType type = WebSocketMessageType::Text) override;
     void send(
-        const std::string &msg,
+        std::string_view msg,
+        const WebSocketMessageType type = WebSocketMessageType::Text) override;
+    void sendJson(
+        const Json::Value &json,
         const WebSocketMessageType type = WebSocketMessageType::Text) override;
 
     const trantor::InetAddress &localAddr() const override;
@@ -106,6 +115,7 @@ class WebSocketConnectionImpl final
     trantor::InetAddress localAddr_;
     trantor::InetAddress peerAddr_;
     bool isServer_{true};
+    bool closeReceived_{false};
     WebSocketMessageParser parser_;
     trantor::TimerId pingTimerId_{trantor::InvalidTimerId};
     std::vector<uint32_t> masks_;

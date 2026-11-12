@@ -21,6 +21,7 @@
 #include <trantor/utils/NonCopyable.h>
 #include <string>
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace drogon
@@ -36,22 +37,26 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
     {
         masquerading_ = true;
         masqueradingVector_ = pMasqueradingVector;
+        masqueradingMap_.clear();
         for (size_t i = 0; i < masqueradingVector_.size(); ++i)
         {
             masqueradingMap_.insert(
                 std::pair<std::string, size_t>{masqueradingVector_[i], i});
         }
     }
+
     void disableMasquerading()
     {
         masquerading_ = false;
         masqueradingVector_ = columnsVector_;
+        masqueradingMap_.clear();
         for (size_t i = 0; i < masqueradingVector_.size(); ++i)
         {
             masqueradingMap_.insert(
                 std::pair<std::string, size_t>{masqueradingVector_[i], i});
         }
     }
+
     void registerAJsonValidator(
         const std::string &fieldName,
         const std::function<bool(const Json::Value &, std::string &)>
@@ -59,6 +64,7 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
     {
         validators_.emplace_back(fieldName, validator);
     }
+
     void registerAJsonValidator(
         const std::string &fieldName,
         std::function<bool(const Json::Value &, std::string &)> &&validator)
@@ -69,7 +75,7 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
     /**
      * @brief make a criteria object for searching by ORM.
      *
-     * @param pJson the json object presenting search criterias.
+     * @param pJson the json object presenting search criteria.
      * The json object must be an array of depth 3.
      * for example:
      * [
@@ -93,6 +99,22 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
         : columnsVector_(columnsVector)
     {
     }
+
+    std::optional<size_t> columnIndexForField(const std::string &field) const
+    {
+        if (field.empty())
+        {
+            return std::nullopt;
+        }
+        auto iter = masqueradingMap_.find(field);
+        if (iter == masqueradingMap_.end() ||
+            iter->second >= columnsVector_.size())
+        {
+            return std::nullopt;
+        }
+        return iter->second;
+    }
+
     std::vector<std::string> fieldsSelector(const std::set<std::string> &fields)
     {
         std::vector<std::string> ret;
@@ -109,6 +131,7 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
         }
         return ret;
     }
+
     template <typename T>
     Json::Value makeJson(const HttpRequestPtr &req, const T &obj)
     {
@@ -139,6 +162,7 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
             }
         }
     }
+
     bool doCustomValidations(const Json::Value &pJson, std::string &err)
     {
         for (auto &validator : validators_)
@@ -153,10 +177,12 @@ class DROGON_EXPORT RestfulController : trantor::NonCopyable
         }
         return true;
     }
+
     bool isMasquerading() const
     {
         return masquerading_;
     }
+
     const std::vector<std::string> &masqueradingVector() const
     {
         return masqueradingVector_;

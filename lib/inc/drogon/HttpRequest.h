@@ -15,8 +15,6 @@
 #pragma once
 
 #include <drogon/exports.h>
-#include <drogon/utils/string_view.h>
-#include <drogon/utils/optional.h>
 #include <drogon/utils/Utilities.h>
 #include <drogon/DrClassMap.h>
 #include <drogon/HttpTypes.h>
@@ -25,10 +23,14 @@
 #include <drogon/UploadFile.h>
 #include <json/json.h>
 #include <trantor/net/InetAddress.h>
+#include <trantor/net/Certificate.h>
 #include <trantor/utils/Date.h>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <optional>
+#include <string_view>
+#include <trantor/net/TcpConnection.h>
 
 namespace drogon
 {
@@ -64,6 +66,7 @@ template <>
 HttpRequestPtr toRequest<const Json::Value &>(const Json::Value &pJson);
 template <>
 HttpRequestPtr toRequest(Json::Value &&pJson);
+
 template <>
 inline HttpRequestPtr toRequest<Json::Value &>(Json::Value &pJson)
 {
@@ -107,6 +110,7 @@ class DROGON_EXPORT HttpRequest
 
     /// Return the method string of the request, such as GET, POST, etc.
     virtual const char *methodString() const = 0;
+
     const char *getMethodString() const
     {
         return methodString();
@@ -114,15 +118,26 @@ class DROGON_EXPORT HttpRequest
 
     /// Return the enum type method of the request.
     virtual HttpMethod method() const = 0;
+
     HttpMethod getMethod() const
     {
         return method();
     }
 
+    /**
+     * @brief Check if the method is or was HttpMethod::Head
+     * @details Allows to know that an incoming request is a HEAD request, since
+     *          drogon sets the method to HttpMethod::Get before calling the
+     *          controller
+     * @return true if method() returns HttpMethod::Head, or HttpMethod::Get but
+     *              was previously HttpMethod::Head
+     */
+    virtual bool isHead() const = 0;
+
     /// Get the header string identified by the key parameter.
     /**
      * @note
-     * If there is no the header, a empty string is retured.
+     * If there is no the header, a empty string is returned.
      * The key is case insensitive
      */
     virtual const std::string &getHeader(std::string key) const = 0;
@@ -133,6 +148,8 @@ class DROGON_EXPORT HttpRequest
      * @param field The field parameter is transformed to lower case before
      * storing.
      * @param value The value of the header.
+     * @note The header is ignored if the field or the value contains CR or LF
+     * characters, to prevent CRLF injection.
      */
     virtual void addHeader(std::string field, const std::string &value) = 0;
     virtual void addHeader(std::string field, std::string &&value) = 0;
@@ -144,27 +161,39 @@ class DROGON_EXPORT HttpRequest
      */
     virtual void removeHeader(std::string key) = 0;
 
+    // Clear all HTTP headers
+    virtual void clearHeaders() = 0;
+
     /// Get the cookie string identified by the field parameter
     virtual const std::string &getCookie(const std::string &field) const = 0;
 
     /// Get all headers of the request
-    virtual const std::unordered_map<std::string, std::string> &headers()
-        const = 0;
+    virtual const SafeStringMap<std::string> &headers() const = 0;
 
     /// Get all headers of the request
-    const std::unordered_map<std::string, std::string> &getHeaders() const
+    const SafeStringMap<std::string> &getHeaders() const
     {
         return headers();
     }
 
     /// Get all cookies of the request
-    virtual const std::unordered_map<std::string, std::string> &cookies()
-        const = 0;
+    virtual const SafeStringMap<std::string> &cookies() const = 0;
 
     /// Get all cookies of the request
-    const std::unordered_map<std::string, std::string> &getCookies() const
+    const SafeStringMap<std::string> &getCookies() const
     {
         return cookies();
+    }
+
+    /**
+     * @brief Return content length parsed from the Content-Length header
+     * If no Content-Length header, return null.
+     */
+    virtual size_t realContentLength() const = 0;
+
+    size_t getRealContentLength() const
+    {
+        return realContentLength();
     }
 
     /// Get the query string of the request.
@@ -181,17 +210,18 @@ class DROGON_EXPORT HttpRequest
 
     /// Get the content string of the request, which is the body part of the
     /// request.
-    string_view body() const
+    std::string_view body() const
     {
-        return string_view(bodyData(), bodyLength());
+        return std::string_view(bodyData(), bodyLength());
     }
 
     /// Get the content string of the request, which is the body part of the
     /// request.
-    string_view getBody() const
+    std::string_view getBody() const
     {
         return body();
     }
+
     virtual const char *bodyData() const = 0;
     virtual size_t bodyLength() const = 0;
 
@@ -204,6 +234,9 @@ class DROGON_EXPORT HttpRequest
     /// Get the path of the request.
     virtual const std::string &path() const = 0;
 
+    /// Get the original path of the request.(before url-decoding)
+    virtual const std::string &getOriginalPath() const = 0;
+
     /// Get the path of the request.
     const std::string &getPath() const
     {
@@ -211,23 +244,32 @@ class DROGON_EXPORT HttpRequest
     }
 
     /// Get the matched path pattern after routing
-    string_view getMatchedPathPattern() const
+    std::string_view getMatchedPathPattern() const
     {
         return matchedPathPattern();
     }
 
     /// Get the matched path pattern after routing
-    string_view matchedPathPattern() const
+    std::string_view matchedPathPattern() const
     {
-        return string_view(matchedPathPatternData(),
-                           matchedPathPatternLength());
+        return std::string_view(matchedPathPatternData(),
+                                matchedPathPatternLength());
     }
+
+    /// Get the matched path pattern after routing (including matched parameters
+    /// in the query string)
+    virtual const std::vector<std::string> &getRoutingParameters() const = 0;
+
+    /// This method usually is called by the framework.
+    virtual void setRoutingParameters(std::vector<std::string> &&params) = 0;
+
     virtual const char *matchedPathPatternData() const = 0;
     virtual size_t matchedPathPatternLength() const = 0;
 
     /// Return the string of http version of request, such as HTTP/1.0,
     /// HTTP/1.1, etc.
     virtual const char *versionString() const = 0;
+
     const char *getVersionString() const
     {
         return versionString();
@@ -236,7 +278,7 @@ class DROGON_EXPORT HttpRequest
     /// Return the enum type version of the request.
     /**
      * kHttp10 means Http version is 1.0
-     * kHttp11 means Http verison is 1.1
+     * kHttp11 means Http version is 1.1
      */
     virtual Version version() const = 0;
 
@@ -267,11 +309,10 @@ class DROGON_EXPORT HttpRequest
     }
 
     /// Get parameters of the request.
-    virtual const std::unordered_map<std::string, std::string> &parameters()
-        const = 0;
+    virtual const SafeStringMap<std::string> &parameters() const = 0;
 
     /// Get parameters of the request.
-    const std::unordered_map<std::string, std::string> &getParameters() const
+    const SafeStringMap<std::string> &getParameters() const
     {
         return parameters();
     }
@@ -280,7 +321,7 @@ class DROGON_EXPORT HttpRequest
     virtual const std::string &getParameter(const std::string &key) const = 0;
 
     /**
-     * @brief Get the optional parameter identified by the @param key. if the
+     * @brief Get the optional parameter identified by the @p key. if the
      * parameter doesn't exist, or the original parameter can't be converted to
      * a T type object, an empty optional object is returned.
      *
@@ -289,7 +330,7 @@ class DROGON_EXPORT HttpRequest
      * @return optional<T>
      */
     template <typename T>
-    optional<T> getOptionalParameter(const std::string &key)
+    std::optional<T> getOptionalParameter(const std::string &key)
     {
         auto &params = getParameters();
         auto it = params.find(key);
@@ -297,22 +338,24 @@ class DROGON_EXPORT HttpRequest
         {
             try
             {
-                return optional<T>(drogon::utils::fromString<T>(it->second));
+                return std::optional<T>(
+                    drogon::utils::fromString<T>(it->second));
             }
             catch (const std::exception &e)
             {
                 LOG_ERROR << e.what();
-                return optional<T>{};
+                return std::optional<T>{};
             }
         }
         else
         {
-            return optional<T>{};
+            return std::optional<T>{};
         }
     }
 
     /// Return the remote IP address and port
     virtual const trantor::InetAddress &peerAddr() const = 0;
+
     const trantor::InetAddress &getPeerAddr() const
     {
         return peerAddr();
@@ -320,6 +363,7 @@ class DROGON_EXPORT HttpRequest
 
     /// Return the local IP address and port
     virtual const trantor::InetAddress &localAddr() const = 0;
+
     const trantor::InetAddress &getLocalAddr() const
     {
         return localAddr();
@@ -327,9 +371,18 @@ class DROGON_EXPORT HttpRequest
 
     /// Return the creation timestamp set by the framework.
     virtual const trantor::Date &creationDate() const = 0;
+
     const trantor::Date &getCreationDate() const
     {
         return creationDate();
+    }
+
+    // Return the peer certificate (if any)
+    virtual const trantor::CertificatePtr &peerCertificate() const = 0;
+
+    const trantor::CertificatePtr &getPeerCertificate() const
+    {
+        return peerCertificate();
     }
 
     /// Get the Json object of the request
@@ -357,6 +410,7 @@ class DROGON_EXPORT HttpRequest
 
     /// Get the content type
     virtual ContentType contentType() const = 0;
+
     ContentType getContentType() const
     {
         return contentType();
@@ -366,7 +420,10 @@ class DROGON_EXPORT HttpRequest
     virtual void setMethod(const HttpMethod method) = 0;
 
     /// Set the path of the request
+    /// @note The path is automatically encoded. use
+    /// @c setPathEncode(false) to avoid this.
     virtual void setPath(const std::string &path) = 0;
+    virtual void setPath(std::string &&path) = 0;
 
     /**
      * @brief The default behavior is to encode the value of setPath
@@ -382,6 +439,20 @@ class DROGON_EXPORT HttpRequest
     virtual void setParameter(const std::string &key,
                               const std::string &value) = 0;
 
+    /**
+     * Set the parameter to the query,
+     * regardless of the HTTP method or content type
+     */
+    virtual void setQueryParameter(const std::string &key,
+                                   const std::string &value) = 0;
+    /**
+     * Set the parameter to the request body.
+     * @warning The content type must be @c application/x-www-form-urlencoded
+     * or @c multipart/form-data
+     */
+    virtual void setBodyParameter(const std::string &key,
+                                  const std::string &value) = 0;
+
     /// Set or get the content type
     virtual void setContentTypeCode(const ContentType type) = 0;
 
@@ -389,7 +460,7 @@ class DROGON_EXPORT HttpRequest
     /// CRLF. Or just the MIME type
     //
     /// For example, "content-type: text/plain\r\n" or "text/plain"
-    void setContentTypeString(const string_view &typeString)
+    void setContentTypeString(const std::string_view &typeString)
     {
         setContentTypeString(typeString.data(), typeString.size());
     }
@@ -399,14 +470,14 @@ class DROGON_EXPORT HttpRequest
     /// For example, "content-type: text/plain\r\n"
     virtual void setCustomContentTypeString(const std::string &type) = 0;
 
-    /// Add a cookie
-    virtual void addCookie(const std::string &key,
-                           const std::string &value) = 0;
+    /// Add a cookie. The cookie is ignored if its key or value contains CR or
+    /// LF characters.
+    virtual void addCookie(std::string key, std::string value) = 0;
 
     /**
      * @brief Set the request object to the pass-through mode or not. It's not
      * by default when a new request object is created.
-     * In pass-through mode, no addtional headers (including user-agent,
+     * In pass-through mode, no additional headers (including user-agent,
      * connection, etc.) are added to the request. This mode is useful for some
      * applications such as a proxy.
      *
@@ -452,9 +523,45 @@ class DROGON_EXPORT HttpRequest
         return toRequest(std::forward<T>(obj));
     }
 
+    /*! \brief Check if the request is a CORS request.
+     *  \details It should contain:
+     *              - Origin: origination page
+     *  \returns true if the Origin header is present
+     */
+    inline bool isCorsRequest() const
+    {
+        // Check presence of required headers
+        return headers().find("origin") != headers().end();
+    }
+
+    /*! \brief Check if the request is a CORS pre-flight request.
+     *  \details Check if the method of the request is OPTIONS and if it is
+     *           a CORS pre-flight request.\n
+     *           It should contain:
+     *              - Origin: origination page
+     *              - Access-Control-Request-Method: method to be used in the
+     *                actual request
+     *  \returns true if the method is OPTIONS and the required CORS pre-flight
+     *                headers are present
+     */
+    inline bool isCorsPreflightRequest() const
+    {
+        if (method() != HttpMethod::Options)
+            return false;
+        // Check presence of required headers
+        return isCorsRequest() &&
+               headers().find("access-control-request-method") !=
+                   headers().end();
+    }
+
     virtual bool isOnSecureConnection() const noexcept = 0;
     virtual void setContentTypeString(const char *typeString,
                                       size_t typeStringLength) = 0;
+
+    virtual bool connected() const noexcept = 0;
+
+    virtual const std::weak_ptr<trantor::TcpConnection> &getConnectionPtr()
+        const noexcept = 0;
 
     virtual ~HttpRequest()
     {

@@ -21,10 +21,12 @@
 #include <drogon/utils/Utilities.h>
 #include <trantor/net/InetAddress.h>
 #include <trantor/utils/Date.h>
+#include <trantor/utils/Logger.h>
 #include <trantor/utils/MsgBuffer.h>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <atomic>
 #include <unordered_map>
 
@@ -38,6 +40,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
     HttpResponseImpl() : creationDate_(trantor::Date::now())
     {
     }
+
     HttpResponseImpl(HttpStatusCode code, ContentType type)
         : statusCode_(code),
           statusMessage_(statusCodeToString(code)),
@@ -47,10 +50,12 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
           contentTypeString_(contentTypeToMime(type))
     {
     }
+
     void setPassThrough(bool flag) override
     {
         passThrough_ = flag;
     }
+
     HttpStatusCode statusCode() const override
     {
         return statusCode_;
@@ -69,10 +74,15 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
 
     void setVersion(const Version v) override
     {
-        version_ = v;
+        if (version_ != v)
+        {
+            version_ = v;
+            // The version is part of the rendered status line.
+            invalidateRenderCache();
+        }
         if (version_ == Version::kHttp10)
         {
-            closeConnection_ = true;
+            setCloseConnectionInternal(true);
         }
     }
 
@@ -81,16 +91,47 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
         return version_;
     }
 
-    virtual const char *versionString() const override;
+    const char *versionString() const override;
 
     void setCloseConnection(bool on) override
     {
-        closeConnection_ = on;
+        closeConnectionSetByUser_ = true;
+        setCloseConnectionInternal(on);
     }
 
     bool ifCloseConnection() const override
     {
         return closeConnection_;
+    }
+
+    /**
+     * @brief Set the close-connection flag without marking it as an explicit
+     * application decision.
+     *
+     * Used by the framework to apply the client's keep-alive preference. Kept
+     * off the public HttpResponse interface so that the ABI is unchanged.
+     */
+    void setCloseConnectionInternal(bool on)
+    {
+        if (closeConnection_ == on)
+            return;
+        closeConnection_ = on;
+        // The flag is emitted as a "connection" header, so anything rendered
+        // earlier is now stale. This matters most for responses with an
+        // expired time, whose entire rendering is memoized in httpString_ and
+        // would otherwise keep sending the previous header forever.
+        invalidateRenderCache();
+    }
+
+    /**
+     * @brief Whether the application explicitly called setCloseConnection().
+     *
+     * Distinguishes a deliberate handler decision from a side effect of
+     * setVersion(), so that the framework only overrides the latter.
+     */
+    bool closeConnectionSetByUser() const
+    {
+        return closeConnectionSetByUser_;
     }
 
     void setContentTypeCode(ContentType type) override
@@ -116,24 +157,28 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
 
     const std::string &getHeader(std::string key) const override
     {
-        transform(key.begin(), key.end(), key.begin(), ::tolower);
+        transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+            return tolower(c);
+        });
         return getHeaderBy(key);
     }
 
     void removeHeader(std::string key) override
     {
-        transform(key.begin(), key.end(), key.begin(), ::tolower);
+        transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+            return tolower(c);
+        });
         removeHeaderBy(key);
     }
 
-    const std::unordered_map<std::string, std::string> &headers() const override
+    const SafeStringMap<std::string> &headers() const override
     {
         return headers_;
     }
 
     const std::string &getHeaderBy(const std::string &lowerKey) const
     {
-        const static std::string defaultVal;
+        static const std::string defaultVal;
         auto iter = headers_.find(lowerKey);
         if (iter == headers_.end())
         {
@@ -150,32 +195,48 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
 
     void addHeader(std::string field, const std::string &value) override
     {
+        if (!isValidHeader(field, value))
+            return;
         fullHeaderString_.reset();
-        transform(field.begin(), field.end(), field.begin(), ::tolower);
+        transform(field.begin(),
+                  field.end(),
+                  field.begin(),
+                  [](unsigned char c) { return tolower(c); });
         headers_[std::move(field)] = value;
     }
 
     void addHeader(std::string field, std::string &&value) override
     {
+        if (!isValidHeader(field, value))
+            return;
         fullHeaderString_.reset();
-        transform(field.begin(), field.end(), field.begin(), ::tolower);
+        transform(field.begin(),
+                  field.end(),
+                  field.begin(),
+                  [](unsigned char c) { return tolower(c); });
         headers_[std::move(field)] = std::move(value);
     }
 
-    void addHeader(const char *start, const char *colon, const char *end);
+    bool addHeader(std::string_view line);
 
     void addCookie(const std::string &key, const std::string &value) override
     {
+        if (!isValidCookie(key, value))
+            return;
         cookies_[key] = Cookie(key, value);
     }
 
     void addCookie(const Cookie &cookie) override
     {
+        if (!isValidCookie(cookie))
+            return;
         cookies_[cookie.key()] = cookie;
     }
 
     void addCookie(Cookie &&cookie) override
     {
+        if (!isValidCookie(cookie))
+            return;
         cookies_[cookie.key()] = std::move(cookie);
     }
 
@@ -190,7 +251,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
         return defaultCookie;
     }
 
-    const std::unordered_map<std::string, Cookie> &cookies() const override
+    const SafeStringMap<Cookie> &cookies() const override
     {
         return cookies_;
     }
@@ -208,6 +269,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
             addHeader("content-length", std::to_string(bodyPtr_->length()));
         }
     }
+
     void setBody(std::string &&body) override
     {
         bodyPtr_ = std::make_shared<HttpMessageStringBody>(std::move(body));
@@ -219,8 +281,11 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
 
     void redirect(const std::string &url)
     {
+        if (!isValidHeader("location", url))
+            return;
         headers_["location"] = url;
     }
+
     std::shared_ptr<trantor::MsgBuffer> renderToBuffer();
     void renderToBuffer(trantor::MsgBuffer &buffer);
     std::shared_ptr<trantor::MsgBuffer> renderHeaderForHeadMethod();
@@ -253,6 +318,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
         }
         return bodyPtr_->data();
     }
+
     size_t getBodyLength() const override
     {
         if (bodyPtr_)
@@ -262,6 +328,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
 
     void swap(HttpResponseImpl &that) noexcept;
     void parseJson() const;
+
     const std::shared_ptr<Json::Value> &jsonObject() const override
     {
         // Not multi-thread safe but good, because we basically call this
@@ -273,44 +340,94 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
         }
         return jsonPtr_;
     }
+
     const std::string &getJsonError() const override
     {
-        const static std::string none;
+        static const std::string none;
         if (jsonParsingErrorPtr_)
             return *jsonParsingErrorPtr_;
         return none;
     }
+
     void setJsonObject(const Json::Value &pJson)
     {
         flagForParsingJson_ = true;
         flagForSerializingJson_ = false;
         jsonPtr_ = std::make_shared<Json::Value>(pJson);
     }
+
     void setJsonObject(Json::Value &&pJson)
     {
         flagForParsingJson_ = true;
         flagForSerializingJson_ = false;
         jsonPtr_ = std::make_shared<Json::Value>(std::move(pJson));
     }
+
     bool shouldBeCompressed() const;
     void generateBodyFromJson() const;
+
     const std::string &sendfileName() const override
     {
         return sendfileName_;
     }
+
     const SendfileRange &sendfileRange() const override
     {
         return sendfileRange_;
     }
+
+    const trantor::CertificatePtr &peerCertificate() const override
+    {
+        return peerCertificate_;
+    }
+
+    void setPeerCertificate(const trantor::CertificatePtr &cert)
+    {
+        peerCertificate_ = cert;
+    }
+
     void setSendfile(const std::string &filename)
     {
         sendfileName_ = filename;
     }
+
     void setSendfileRange(size_t offset, size_t len)
     {
         sendfileRange_.first = offset;
         sendfileRange_.second = len;
     }
+
+    const std::function<std::size_t(char *, std::size_t)> &streamCallback()
+        const override
+    {
+        return streamCallback_;
+    }
+
+    void setStreamCallback(
+        const std::function<std::size_t(char *, std::size_t)> &callback)
+    {
+        streamCallback_ = callback;
+    }
+
+    const std::function<void(ResponseStreamPtr)> &asyncStreamCallback()
+        const override
+    {
+        return asyncStreamCallback_;
+    }
+
+    void setAsyncStreamCallback(
+        const std::function<void(ResponseStreamPtr)> &callback,
+        bool disableKickoffTimeout)
+    {
+        asyncStreamCallback_ = callback;
+        asyncStreamDisableKickoff_ = disableKickoffTimeout;
+    }
+
+    bool asyncStreamKickoffDisabled() const
+    {
+        return asyncStreamDisableKickoff_;
+    }
+
     void makeHeaderString()
     {
         fullHeaderString_ = std::make_shared<trantor::MsgBuffer>(128);
@@ -331,9 +448,19 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
                 utils::gzipDecompress(bodyPtr_->data(), bodyPtr_->length());
             removeHeaderBy("content-encoding");
             bodyPtr_ =
-                std::make_shared<HttpMessageStringBody>(move(gunzipBody));
+                std::make_shared<HttpMessageStringBody>(std::move(gunzipBody));
             addHeader("content-length", std::to_string(bodyPtr_->length()));
         }
+    }
+
+    bool contentLengthIsAllowed() const
+    {
+        int statusCode =
+            customStatusCode_ >= 0 ? customStatusCode_ : statusCode_;
+
+        // return false if status code is 1xx or 204
+        return (statusCode >= k200OK || statusCode < k100Continue) &&
+               statusCode != k204NoContent;
     }
 #ifdef USE_BROTLI
     void brDecompress()
@@ -344,7 +471,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
                 utils::brotliDecompress(bodyPtr_->data(), bodyPtr_->length());
             removeHeaderBy("content-encoding");
             bodyPtr_ =
-                std::make_shared<HttpMessageStringBody>(move(gunzipBody));
+                std::make_shared<HttpMessageStringBody>(std::move(gunzipBody));
             addHeader("content-length", std::to_string(bodyPtr_->length()));
         }
     }
@@ -366,17 +493,8 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
             }
             else
             {
-                auto pos = contentTypeString.find(';');
-                if (pos != std::string::npos)
-                {
-                    contentType_ = parseContentType(
-                        string_view(contentTypeString.data(), pos));
-                }
-                else
-                {
-                    contentType_ =
-                        parseContentType(string_view(contentTypeString));
-                }
+                contentType_ = parseContentType(
+                    internal::headerValueBeforeParameters(contentTypeString));
 
                 if (contentType_ == CT_NONE)
                     contentType_ = CT_CUSTOM;
@@ -386,6 +504,12 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
     }
 
   private:
+    bool allowCompression_{true};
+
+    void setAllowCompression(bool allow) override;
+
+    bool allowCompression() const override;
+
     void setBody(const char *body, size_t len) override
     {
         bodyPtr_ = std::make_shared<HttpMessageStringViewBody>(body, len);
@@ -394,6 +518,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
             addHeader("content-length", std::to_string(bodyPtr_->length()));
         }
     }
+
     void setContentTypeCodeAndCustomString(ContentType type,
                                            const char *typeString,
                                            size_t typeStringLength) override
@@ -401,7 +526,7 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
         contentType_ = type;
         flagForParsingContentType_ = true;
 
-        string_view sv(typeString, typeStringLength);
+        std::string_view sv(typeString, typeStringLength);
         bool haveHeader = sv.find("content-type: ") == 0;
         bool haveCRLF = sv.rfind("\r\n") == sv.size() - 2;
 
@@ -410,8 +535,8 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
             endOffset += 14;
         if (haveCRLF)
             endOffset += 2;
-        setContentType(string_view{typeString + (haveHeader ? 14 : 0),
-                                   typeStringLength - endOffset});
+        setContentType(std::string_view{typeString + (haveHeader ? 14 : 0),
+                                        typeStringLength - endOffset});
     }
 
     void setContentTypeString(const char *typeString,
@@ -423,27 +548,59 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
     {
         assert(code >= 0);
         customStatusCode_ = code;
-        statusMessage_ = string_view{message, messageLength};
+        if (messageLength != 0 &&
+            containsCRLF(std::string_view{message, messageLength}))
+        {
+            LOG_ERROR << "Invalid characters in status message, ignored";
+            return;
+        }
+        statusMessage_ = std::string_view{message, messageLength};
     }
 
-    std::unordered_map<std::string, std::string> headers_;
-    std::unordered_map<std::string, Cookie> cookies_;
+    /**
+     * @brief Drop every memoized rendering of this response.
+     *
+     * Must be called after changing anything that is baked into the rendered
+     * bytes but is not covered by the fullHeaderString_ resets scattered
+     * through the header setters -- notably the status line and the
+     * "connection" header. Responses with an expired time memoize their whole
+     * rendering in httpString_, so for them a stale cache means the wrong
+     * bytes go out on every subsequent send.
+     */
+    void invalidateRenderCache()
+    {
+        fullHeaderString_.reset();
+        httpString_.reset();
+        datePos_ = static_cast<size_t>(-1);
+        httpStringDate_ = -1;
+    }
+
+    SafeStringMap<std::string> headers_;
+    SafeStringMap<Cookie> cookies_;
 
     int customStatusCode_{-1};
     HttpStatusCode statusCode_{kUnknown};
-    string_view statusMessage_;
+    std::string_view statusMessage_;
 
     trantor::Date creationDate_;
     Version version_{Version::kHttp11};
     bool closeConnection_{false};
+    // True only when the application called setCloseConnection() itself, as
+    // opposed to the flag being set by setVersion() or by the framework
+    // applying the client's keep-alive preference.
+    bool closeConnectionSetByUser_{false};
     mutable std::shared_ptr<HttpMessageBody> bodyPtr_;
     ssize_t expriedTime_{-1};
     std::string sendfileName_;
     SendfileRange sendfileRange_{0, 0};
+    std::function<std::size_t(char *, std::size_t)> streamCallback_;
+    std::function<void(ResponseStreamPtr)> asyncStreamCallback_;
+    bool asyncStreamDisableKickoff_{false};
 
     mutable std::shared_ptr<Json::Value> jsonPtr_;
 
     std::shared_ptr<trantor::MsgBuffer> fullHeaderString_;
+    trantor::CertificatePtr peerCertificate_;
     mutable std::shared_ptr<trantor::MsgBuffer> httpString_;
     mutable size_t datePos_{static_cast<size_t>(-1)};
     mutable int64_t httpStringDate_{-1};
@@ -454,16 +611,29 @@ class DROGON_EXPORT HttpResponseImpl : public HttpResponse
     mutable std::shared_ptr<std::string> jsonParsingErrorPtr_;
     mutable std::string contentTypeString_{"text/html; charset=utf-8"};
     bool passThrough_{false};
-    void setContentType(const string_view &contentType)
+
+    void setContentType(const std::string_view &contentType)
     {
+        if (containsCRLF(contentType))
+        {
+            LOG_ERROR << "Invalid characters in content-type, ignored";
+            return;
+        }
         contentTypeString_ =
             std::string(contentType.data(), contentType.size());
     }
-    void setStatusMessage(const string_view &message)
+
+    void setStatusMessage(const std::string_view &message)
     {
+        if (containsCRLF(message))
+        {
+            LOG_ERROR << "Invalid characters in status message, ignored";
+            return;
+        }
         statusMessage_ = message;
     }
 };
+
 using HttpResponseImplPtr = std::shared_ptr<HttpResponseImpl>;
 
 inline void swap(HttpResponseImpl &one, HttpResponseImpl &two) noexcept

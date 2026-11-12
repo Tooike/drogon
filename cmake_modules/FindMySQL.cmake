@@ -27,6 +27,26 @@
 # ##############################################################################
 
 # -------------- FIND MYSQL_INCLUDE_DIRS ------------------
+find_path(MARIADB_INCLUDE_DIRS
+          NAMES mysql.h
+          PATH_SUFFIXES mariadb
+          PATHS /usr/include/mysql
+                /usr/local/include/mysql
+                /usr/include/mariadb
+                /usr/local/include/mariadb
+                /opt/mysql/mysql/include
+                /opt/mysql/mysql/include/mysql
+                /opt/mysql/include
+                /opt/local/include/mysql5
+                /usr/local/mysql/include
+                /usr/local/mysql/include/mysql
+                /usr/local/mariadb/include
+                /usr/local/mariadb/include/mariadb
+                /opt/rh/rh-mariadb105/root/usr/include
+                /opt/rh/rh-mariadb105/root/usr/include/mysql
+                $ENV{ProgramFiles}/MySQL/*/include
+                $ENV{SystemDrive}/MySQL/*/include)
+
 find_path(MYSQL_INCLUDE_DIRS
           NAMES mysql.h
           PATH_SUFFIXES mysql
@@ -47,7 +67,9 @@ find_path(MYSQL_INCLUDE_DIRS
                 $ENV{ProgramFiles}/MySQL/*/include
                 $ENV{SystemDrive}/MySQL/*/include)
 
-if(EXISTS "${MYSQL_INCLUDE_DIRS}/mysql.h")
+if(EXISTS "${MARIADB_INCLUDE_DIRS}/mysql.h")
+  set(MYSQL_INCLUDE_DIRS ${MARIADB_INCLUDE_DIRS})
+elseif(EXISTS "${MYSQL_INCLUDE_DIRS}/mysql.h")
 
 elseif(EXISTS "${MYSQL_INCLUDE_DIRS}/mysql/mysql.h")
   set(MYSQL_INCLUDE_DIRS ${MYSQL_INCLUDE_DIRS}/mysql)
@@ -77,7 +99,7 @@ if(WIN32)
                      $ENV{SystemDrive}/MySQL/*/lib/${libsuffixDist})
 else(WIN32)
   find_library(MYSQL_LIBRARIES
-               NAMES mysqlclient_r mariadbclient
+               NAMES mysqlclient_r mariadbclient mariadb
                PATHS /usr/lib/mysql
                      /usr/lib/mariadb
                      /usr/local/lib/mysql
@@ -108,12 +130,17 @@ find_package_handle_standard_args(MySQL
                                   MYSQL_INCLUDE_DIRS)
 # Copy the results to the output variables.
 if(MySQL_FOUND)
-  add_library(MySQL_lib INTERFACE IMPORTED)
-  set_target_properties(MySQL_lib
-                        PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                   "${MYSQL_INCLUDE_DIRS}"
-                                   INTERFACE_LINK_LIBRARIES
-                                   "${MYSQL_LIBRARIES}")
+  add_library(MySQL_lib UNKNOWN IMPORTED)
+  set_target_properties(MySQL_lib PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES "${MYSQL_INCLUDE_DIRS}"
+  IMPORTED_LOCATION "${MYSQL_LIBRARIES}")
+  find_package(OpenSSL QUIET)  # try to find openssl
+  if(OpenSSL_FOUND)
+    target_link_libraries(MySQL_lib INTERFACE $<LINK_ONLY:OpenSSL::SSL> $<LINK_ONLY:OpenSSL::Crypto>)
+    message(STATUS "mysql: OpenSSL found!")
+  else()
+    message(STATUS "mysql: OpenSSL missing!")
+  endif()
 else(MySQL_FOUND)
   set(MYSQL_LIBRARIES)
   set(MYSQL_INCLUDE_DIRS)

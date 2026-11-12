@@ -33,8 +33,15 @@ class DbClientImpl : public DbClient,
 {
   public:
     DbClientImpl(const std::string &connInfo,
-                 const size_t connNum,
-                 ClientType type);
+                 size_t connNum,
+#if LIBPQ_SUPPORTS_BATCH_MODE
+                 ClientType type,
+                 bool autoBatch,
+                 const std::vector<std::string> &initializationQueries = {});
+#else
+                 ClientType type,
+                 const std::vector<std::string> &initializationQueries = {});
+#endif
     ~DbClientImpl() noexcept override;
     void execSql(const char *sql,
                  size_t sqlLength,
@@ -47,46 +54,61 @@ class DbClientImpl : public DbClient,
                      &&exceptCallback) override;
     std::shared_ptr<Transaction> newTransaction(
         const std::function<void(bool)> &commitCallback =
-            std::function<void(bool)>()) noexcept(false) override;
+            std::function<void(bool)>(),
+        TransactionType transType =
+            TransactionType::Deferred) noexcept(false) override;
     void newTransactionAsync(
         const std::function<void(const std::shared_ptr<Transaction> &)>
-            &callback) override;
+            &callback,
+        TransactionType transType = TransactionType::Deferred) override;
     bool hasAvailableConnections() const noexcept override;
+
     void setTimeout(double timeout) override
     {
         timeout_ = timeout;
     }
+
+    void setReconnectInterval(double interval) override
+    {
+        reconnectInterval_ = interval;
+    }
+
     void init();
+    void closeAll() override;
 
   private:
     size_t numberOfConnections_;
     trantor::EventLoopThreadPool loops_;
     std::shared_ptr<SharedMutex> sharedMutexPtr_;
+    std::vector<std::string> initializationQueries_;
     double timeout_{-1.0};
-    void execSql(
-        const DbConnectionPtr &conn,
-        string_view &&sql,
-        size_t paraNum,
-        std::vector<const char *> &&parameters,
-        std::vector<int> &&length,
-        std::vector<int> &&format,
-        ResultCallback &&rcb,
-        std::function<void(const std::exception_ptr &)> &&exceptCallback);
-
+    double reconnectInterval_{1.0};
+#if LIBPQ_SUPPORTS_BATCH_MODE
+    bool autoBatch_{false};
+#endif
     DbConnectionPtr newConnection(trantor::EventLoop *loop);
 
     void makeTrans(
         const DbConnectionPtr &conn,
-        std::function<void(const std::shared_ptr<Transaction> &)> &&callback);
+        std::function<void(const std::shared_ptr<Transaction> &)> &&callback,
+        TransactionType transType = TransactionType::Deferred);
 
     mutable std::mutex connectionsMutex_;
     std::unordered_set<DbConnectionPtr> connections_;
+    // Set by closeAll() (under connectionsMutex_) so that newConnection()
+    // cannot start a connection after the pool has been closed.
+    bool closed_{false};
     std::unordered_set<DbConnectionPtr> readyConnections_;
     std::unordered_set<DbConnectionPtr> busyConnections_;
+    // Retired SQLite connections stay owned until closeAll(), so their threads
+    // are not destroyed from inside a connection callback.
+    size_t failedSqliteConnections_{0};
 
-    std::list<std::shared_ptr<
-        std::function<void(const std::shared_ptr<Transaction> &)>>>
-        transCallbacks_;
+    using TransCallbackEntry =
+        std::pair<std::shared_ptr<std::function<void(
+                      const std::shared_ptr<Transaction> &)>>,
+                  TransactionType>;
+    std::list<TransCallbackEntry> transCallbacks_;
 
     std::deque<std::shared_ptr<SqlCmd>> sqlCmdBuffer_;
 

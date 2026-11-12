@@ -17,9 +17,17 @@ add_executable(_drogon_ctl
                create.cc
                create_view.cc)
 target_link_libraries(_drogon_ctl ${PROJECT_NAME})
-if (WIN32 AND BUILD_DROGON_SHARED)
+target_compile_definitions(_drogon_ctl PRIVATE
+    DEFAULT_SOURCE_EXTENSION=${DEFAULT_SOURCE_EXTENSION}
+    DEFAULT_HEADER_EXTENSION=${DEFAULT_HEADER_EXTENSION}
+    )
+if (WIN32 AND BUILD_SHARED_LIBS)
   set(DROGON_FILE $<TARGET_FILE:drogon>)
-  set(TRANTOR_FILE $<TARGET_FILE:trantor>)
+  if (USE_SUBMODULE)
+    set(TRANTOR_FILE $<TARGET_FILE:trantor>)
+  else()
+    set(TRANTOR_FILE $<TARGET_FILE:Trantor::Trantor>)
+  endif()
   add_custom_command(TARGET _drogon_ctl POST_BUILD
           COMMAND ${CMAKE_COMMAND}
           -DCTL_FILE=${DROGON_FILE}
@@ -38,27 +46,32 @@ foreach(cspFile ${SCP_LIST})
   message(STATUS "cspFile:" ${cspFile})
   get_filename_component(classname ${cspFile} NAME_WE)
   message(STATUS "view classname:" ${classname})
-  add_custom_command(OUTPUT ${classname}.h ${classname}.cc
-                     COMMAND $<TARGET_FILE:_drogon_ctl>
+  add_custom_command(OUTPUT ${classname}.${DEFAULT_HEADER_EXTENSION} ${classname}.${DEFAULT_SOURCE_EXTENSION}
+                     COMMAND ${DROGON_CTL}
                              ARGS
                              create
                              view
                              ${cspFile}
                      DEPENDS ${cspFile}
                      VERBATIM)
-  set(TEMPL_SRC ${TEMPL_SRC} ${classname}.cc)
+  set(TEMPL_SRC ${TEMPL_SRC} ${classname}.${DEFAULT_SOURCE_EXTENSION})
 endforeach()
 add_executable(drogon_ctl ${ctl_sources} ${TEMPL_SRC})
+target_compile_definitions(drogon_ctl PRIVATE
+    DEFAULT_SOURCE_EXTENSION=${DEFAULT_SOURCE_EXTENSION}
+    DEFAULT_HEADER_EXTENSION=${DEFAULT_HEADER_EXTENSION}
+    )
 target_link_libraries(drogon_ctl PRIVATE ${PROJECT_NAME})
 target_include_directories(drogon_ctl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_dependencies(drogon_ctl _drogon_ctl)
 if(WIN32)
-  target_link_libraries(drogon_ctl PRIVATE ws2_32 Rpcrt4)
+  target_link_libraries(drogon_ctl PRIVATE ws2_32 rpcrt4 iphlpapi)
 endif(WIN32)
 if(APPLE)
   target_link_libraries(drogon_ctl PRIVATE resolv)
 endif()
 message(STATUS "bin:" ${INSTALL_BIN_DIR})
+install(TARGETS _drogon_ctl RUNTIME DESTINATION ${INSTALL_BIN_DIR})
 install(TARGETS drogon_ctl RUNTIME DESTINATION ${INSTALL_BIN_DIR})
 if(WIN32)
   set(CTL_FILE $<TARGET_FILE:drogon_ctl>)

@@ -13,10 +13,12 @@
  */
 
 #include "help.h"
+#include "extension.h"
 #include <drogon/DrClassMap.h>
 #include <iostream>
 #include <memory>
 using namespace drogon_ctl;
+
 void help::handleCommand(std::vector<std::string> &parameters)
 {
     if (parameters.size() == 0)
@@ -24,6 +26,13 @@ void help::handleCommand(std::vector<std::string> &parameters)
         std::cout << "usage: drogon_ctl [-v | --version] [-h | --help] "
                      "<command> [<args>]"
                   << std::endl;
+        std::cout << "Global Options:" << std::endl;
+        std::cout << "  -se, --source-ext, --source-extension <ext>  Specify "
+                     "output source file extension (default: "
+                  << sourceExtension << ")" << std::endl;
+        std::cout << "  -he, --header-ext, --header-extension <ext>  Specify "
+                     "output header file extension (default: "
+                  << headerExtension << ")" << std::endl;
         std::cout << "commands list:" << std::endl;
         for (auto &className : drogon::DrClassMap::getAllClassName())
         {
@@ -67,3 +76,6 @@ void help::handleCommand(std::vector<std::string> &parameters)
         }
     }
 }
+
+// See create.cc for rationale.
+template class drogon::DrObject<drogon_ctl::help>;

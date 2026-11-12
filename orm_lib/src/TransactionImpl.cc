@@ -14,24 +14,79 @@
 
 #include "TransactionImpl.h"
 #include "../../lib/src/TaskTimeoutFlag.h"
-#include <drogon/utils/string_view.h>
+#if USE_SQLITE3
+#include "sqlite3_impl/Sqlite3Connection.h"
+#endif
+#include <string_view>
 #include <trantor/utils/Logger.h>
 
 using namespace drogon::orm;
 using namespace drogon;
 
-TransactionImpl::TransactionImpl(
-    ClientType type,
-    const DbConnectionPtr &connPtr,
-    const std::function<void(bool)> &commitCallback,
-    const std::function<void()> &usedUpCallback)
+namespace
+{
+#if USE_SQLITE3
+void rollbackFailedSqliteCommit(const DbConnectionPtr &conn,
+                                const std::function<void()> &usedUpCallback,
+                                const std::function<void(bool)> &commitCallback)
+{
+    // SQLite can leave the transaction open after COMMIT fails. Do not return
+    // this connection to the pool when the failed command becomes idle.
+    conn->setIdleCallback([]() {});
+    conn->loop()->queueInLoop([conn, usedUpCallback, commitCallback]() {
+        auto sqlite = std::static_pointer_cast<Sqlite3Connection>(conn);
+        auto finish = [sqlite, usedUpCallback, commitCallback](bool reusable) {
+            // Let the failed statement and its callbacks finish before closing
+            // the connection or allowing the pool to dispatch another query.
+            sqlite->loop()->queueInLoop(
+                [sqlite, usedUpCallback, commitCallback, reusable]() {
+                    if (!reusable)
+                        sqlite->invalidate();
+                    if (commitCallback)
+                        commitCallback(false);
+                    if (reusable && usedUpCallback)
+                        usedUpCallback();
+                });
+        };
+        // Some COMMIT errors already roll back the entire transaction.
+        if (!sqlite->hasActiveTransaction())
+        {
+            finish(true);
+            return;
+        }
+        conn->execSql(
+            "rollback",
+            0,
+            {},
+            {},
+            {},
+            [sqlite, finish](const Result &) {
+                LOG_TRACE << "Transaction rolled back after failed commit";
+                finish(!sqlite->hasActiveTransaction());
+            },
+            [sqlite, finish](const std::exception_ptr &) {
+                LOG_ERROR << "Transaction rollback after failed commit failed";
+                finish(!sqlite->hasActiveTransaction());
+            });
+    });
+}
+#endif
+}  // namespace
+
+TransactionImpl::TransactionImpl(ClientType type,
+                                 const DbConnectionPtr &connPtr,
+                                 std::function<void(bool)> commitCallback,
+                                 std::function<void()> usedUpCallback,
+                                 TransactionType transType)
     : connectionPtr_(connPtr),
-      usedUpCallback_(usedUpCallback),
+      usedUpCallback_(std::move(usedUpCallback)),
       loop_(connPtr->loop()),
-      commitCallback_(commitCallback)
+      commitCallback_(std::move(commitCallback)),
+      transactionType_(transType)
 {
     type_ = type;
 }
+
 TransactionImpl::~TransactionImpl()
 {
     LOG_TRACE << "Destruct";
@@ -40,36 +95,44 @@ TransactionImpl::~TransactionImpl()
     {
         auto loop = connectionPtr_->loop();
         loop->queueInLoop([conn = connectionPtr_,
+                           type = type_,
                            ucb = std::move(usedUpCallback_),
                            commitCb = std::move(commitCallback_)]() {
-            conn->setIdleCallback([ucb = std::move(ucb)]() {
+            conn->setIdleCallback([ucb]() {
                 if (ucb)
                     ucb();
             });
             conn->execSql(
                 "commit",
                 0,
-                std::vector<const char *>(),
-                std::vector<int>(),
-                std::vector<int>(),
+                {},
+                {},
+                {},
                 [commitCb](const Result &) {
-                    LOG_TRACE << "Transaction commited!";
+                    LOG_TRACE << "Transaction committed!";
                     if (commitCb)
                     {
                         commitCb(true);
                     }
                 },
-                [commitCb](const std::exception_ptr &ePtr) {
-                    if (commitCb)
+                [conn, type, ucb, commitCb](const std::exception_ptr &ePtr) {
+                    try
                     {
-                        try
+                        std::rethrow_exception(ePtr);
+                    }
+                    catch (const DrogonDbException &e)
+                    {
+                        LOG_ERROR << "Transaction submission failed:"
+                                  << e.base().what();
+#if USE_SQLITE3
+                        if (type == ClientType::Sqlite3)
                         {
-                            std::rethrow_exception(ePtr);
+                            rollbackFailedSqliteCommit(conn, ucb, commitCb);
+                            return;
                         }
-                        catch (const DrogonDbException &e)
+#endif
+                        if (commitCb)
                         {
-                            LOG_ERROR << "Transaction submission failed:"
-                                      << e.base().what();
                             commitCb(false);
                         }
                     }
@@ -84,8 +147,9 @@ TransactionImpl::~TransactionImpl()
         }
     }
 }
+
 void TransactionImpl::execSqlInLoop(
-    string_view &&sql,
+    std::string_view &&sql,
     size_t paraNum,
     std::vector<const char *> &&parameters,
     std::vector<int> &&length,
@@ -169,7 +233,7 @@ void TransactionImpl::rollback()
             cmdPtr->exceptionCallback_ = [thisPtr](const std::exception_ptr &) {
                 // clearupCb();
                 thisPtr->isCommitedOrRolledback_ = true;
-                LOG_ERROR << "Transaction rool back error";
+                LOG_ERROR << "Transaction roll back error";
             };
             cmdPtr->isRollbackCmd_ = true;
             // Rollback cmd should be executed firstly, so we push it in front
@@ -182,9 +246,9 @@ void TransactionImpl::rollback()
         thisPtr->connectionPtr_->execSql(
             "rollback",
             0,
-            std::vector<const char *>(),
-            std::vector<int>(),
-            std::vector<int>(),
+            {},
+            {},
+            {},
             [thisPtr](const Result &) {
                 LOG_TRACE << "Transaction roll back!";
                 thisPtr->isCommitedOrRolledback_ = true;
@@ -192,7 +256,7 @@ void TransactionImpl::rollback()
             },
             [thisPtr](const std::exception_ptr &) {
                 // clearupCb();
-                LOG_ERROR << "Transaction rool back error";
+                LOG_ERROR << "Transaction roll back error";
                 thisPtr->isCommitedOrRolledback_ = true;
             });
     });
@@ -202,6 +266,8 @@ void TransactionImpl::execNewTask()
 {
     loop_->assertInLoopThread();
     thisPtr_.reset();
+    if (!isWorking_)
+        return;
     assert(isWorking_);
     if (!isCommitedOrRolledback_)
     {
@@ -243,24 +309,48 @@ void TransactionImpl::execNewTask()
     else
     {
         isWorking_ = false;
-        if (!sqlCmdBuffer_.empty())
+        failBufferedCommands(std::make_exception_ptr(
+            TransactionRollback("The transaction has been rolled back")));
+        releaseConnection();
+    }
+}
+
+void TransactionImpl::releaseConnection()
+{
+    if (usedUpCallback_)
+    {
+        usedUpCallback_();
+        usedUpCallback_ = std::function<void()>();
+    }
+}
+
+void TransactionImpl::failBufferedCommands(const std::exception_ptr &ePtr)
+{
+    std::list<SqlCmdPtr> pendingCmds;
+    pendingCmds.swap(sqlCmdBuffer_);
+    for (auto &cmd : pendingCmds)
+    {
+        cmd->thisPtr_.reset();
+        if (cmd->exceptionCallback_)
         {
-            auto exceptPtr = std::make_exception_ptr(
-                TransactionRollback("The transaction has been rolled back"));
-            for (auto const &cmd : sqlCmdBuffer_)
-            {
-                if (cmd->exceptionCallback_)
-                {
-                    cmd->exceptionCallback_(exceptPtr);
-                }
-            }
-            sqlCmdBuffer_.clear();
+            cmd->exceptionCallback_(ePtr);
         }
-        if (usedUpCallback_)
-        {
-            usedUpCallback_();
-            usedUpCallback_ = std::function<void()>();
-        }
+    }
+}
+
+const char *TransactionImpl::beginSql() const noexcept
+{
+    if (type_ != ClientType::Sqlite3)
+        return "begin";
+
+    switch (transactionType_)
+    {
+        case TransactionType::Immediate:
+            return "begin immediate";
+        case TransactionType::Exclusive:
+            return "begin exclusive";
+        default:
+            return "begin";
     }
 }
 
@@ -279,21 +369,35 @@ void TransactionImpl::doBegin()
         thisPtr->isWorking_ = true;
         thisPtr->thisPtr_ = thisPtr;
         thisPtr->connectionPtr_->execSql(
-            "begin",
+            thisPtr->beginSql(),
             0,
-            std::vector<const char *>(),
-            std::vector<int>(),
-            std::vector<int>(),
+            {},
+            {},
+            {},
             [](const Result &) { LOG_TRACE << "Transaction begin!"; },
-            [thisPtr](const std::exception_ptr &) {
-                LOG_ERROR << "Error occurred in transaction begin";
+            [thisPtr](const std::exception_ptr &ePtr) {
+                try
+                {
+                    std::rethrow_exception(ePtr);
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_ERROR << "Error occurred in transaction begin:"
+                              << e.what();
+                }
                 thisPtr->isCommitedOrRolledback_ = true;
+                thisPtr->isWorking_ = false;
+                thisPtr->thisPtr_.reset();
+                thisPtr->failBufferedCommands(std::make_exception_ptr(
+                    TransactionRollback("Transaction begin failed, cannot "
+                                        "execute queued SQL")));
+                thisPtr->releaseConnection();
             });
     });
 }
 
 void TransactionImpl::execSqlInLoopWithTimeout(
-    string_view &&sql,
+    std::string_view &&sql,
     size_t paraNum,
     std::vector<const char *> &&parameters,
     std::vector<int> &&length,
